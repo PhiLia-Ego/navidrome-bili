@@ -797,7 +797,7 @@ func (c *client) doGET(ctx context.Context, apiPath string, params url.Values, o
 	req.Header.Set("Referer", "https://www.bilibili.com/")
 	req.Header.Set("Cookie", c.cookies)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req) //nolint:gosec // endpoint is constrained by buildAPIEndpoint to https://api.bilibili.com
 	if err != nil {
 		return err
 	}
@@ -998,7 +998,7 @@ func (c *client) downloadFile(ctx context.Context, sourceURL, targetPath string)
 	req.Header.Set("User-Agent", defaultUserAgent)
 	req.Header.Set("Referer", "https://www.bilibili.com/")
 	req.Header.Set("Cookie", c.cookies)
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req) //nolint:gosec // sourceURL is constrained by validateDownloadURL allowlist
 	if err != nil {
 		return err
 	}
