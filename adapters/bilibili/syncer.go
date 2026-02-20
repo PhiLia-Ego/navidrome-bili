@@ -91,6 +91,7 @@ type favoriteTarget struct {
 	UpMid   int64
 }
 
+//nolint:gocyclo // Sync orchestrates multiple API and cache steps in one flow.
 func (s *syncer) Sync(ctx context.Context) (SyncResult, error) {
 	if !conf.Server.Bilibili.Enabled {
 		return SyncResult{}, nil
@@ -290,7 +291,7 @@ func ensurePlaceholder(targetFile string, truncate bool) error {
 		return err
 	}
 	if truncate {
-		return os.WriteFile(targetFile, nil, 0644)
+		return os.WriteFile(targetFile, nil, 0600)
 	}
 	if _, err := os.Stat(targetFile); err == nil {
 		return nil
@@ -543,7 +544,7 @@ func saveState(path string, st *syncState) error {
 	if err != nil {
 		return fmt.Errorf("serializing bilibili state: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("writing bilibili state: %w", err)
 	}
 	return nil
@@ -784,9 +785,9 @@ type apiError struct {
 }
 
 func (c *client) doGET(ctx context.Context, apiPath string, params url.Values, out any) error {
-	endpoint := apiBaseURL + apiPath
-	if len(params) > 0 {
-		endpoint += "?" + params.Encode()
+	endpoint, err := buildAPIEndpoint(apiPath, params)
+	if err != nil {
+		return err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -812,16 +813,6 @@ func (c *client) doGET(ctx context.Context, apiPath string, params url.Values, o
 		return fmt.Errorf("invalid bilibili response from %s: %w", apiPath, err)
 	}
 	return nil
-}
-
-func (c *client) resolveMediaID(ctx context.Context, upMid, fid int64) (int64, error) {
-	_ = c
-	_ = ctx
-	_ = upMid
-	if fid == 0 {
-		return 0, errors.New("cannot resolve media_id: empty fid")
-	}
-	return fid, nil
 }
 
 type listResp struct {
@@ -997,6 +988,9 @@ func (c *client) getAudioSources(ctx context.Context, bvid string, cid int64) ([
 }
 
 func (c *client) downloadFile(ctx context.Context, sourceURL, targetPath string) error {
+	if err := validateDownloadURL(sourceURL); err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
 	if err != nil {
 		return err
@@ -1032,6 +1026,49 @@ func (c *client) downloadFile(ctx context.Context, sourceURL, targetPath string)
 		return err
 	}
 	return nil
+}
+
+func buildAPIEndpoint(apiPath string, params url.Values) (string, error) {
+	if !strings.HasPrefix(apiPath, "/") {
+		return "", fmt.Errorf("invalid bilibili api path: %s", apiPath)
+	}
+	endpoint := apiBaseURL + apiPath
+	if len(params) > 0 {
+		endpoint += "?" + params.Encode()
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(u.Scheme, "https") || !strings.EqualFold(u.Hostname(), "api.bilibili.com") {
+		return "", fmt.Errorf("refusing non-bilibili api endpoint: %s", endpoint)
+	}
+	return endpoint, nil
+}
+
+func validateDownloadURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return fmt.Errorf("refusing non-https source url")
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return errors.New("empty source host")
+	}
+	allowedSuffixes := []string{
+		".bilivideo.com",
+		".hdslb.com",
+		".mcdn.bilivideo.cn",
+	}
+	for _, suffix := range allowedSuffixes {
+		if strings.HasSuffix(host, suffix) {
+			return nil
+		}
+	}
+	return fmt.Errorf("refusing untrusted source host: %s", host)
 }
 
 func buildTargetFilename(baseDir, title, artist, bvid string, src audioSource) string {
