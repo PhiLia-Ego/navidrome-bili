@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/navidrome/navidrome/adapters/bilibili"
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/consts"
 	"github.com/navidrome/navidrome/db"
@@ -97,6 +98,7 @@ func runNavidrome(ctx context.Context) {
 	} else {
 		log.Warn(ctx, "Automatic Scanning is DISABLED")
 	}
+	g.Go(schedulePeriodicBilibiliSync(ctx))
 
 	if err := g.Wait(); err != nil {
 		log.Error("Fatal error in Navidrome. Aborting", err)
@@ -183,6 +185,18 @@ func pidHashChanged(ds model.DataStore) (bool, error) {
 // runInitialScan runs an initial scan of the music library if needed.
 func runInitialScan(ctx context.Context) func() error {
 	return func() error {
+		biliChanged := false
+		if conf.Server.Bilibili.Enabled && conf.Server.Bilibili.SyncOnStartup {
+			s := bilibili.NewSyncer()
+			result, err := s.Sync(ctx)
+			if err != nil {
+				log.Error(ctx, "Bilibili startup sync failed before scan", err)
+			} else if result.Changed {
+				log.Info(ctx, "Bilibili startup sync changed local cache, forcing initial scan")
+				biliChanged = true
+			}
+		}
+
 		ds := CreateDataStore()
 		fullScanRequired, err := ds.Property(ctx).DefaultGet(consts.FullScanAfterMigrationFlagKey, "0")
 		if err != nil {
@@ -196,7 +210,7 @@ func runInitialScan(ctx context.Context) func() error {
 		if err != nil {
 			return err
 		}
-		scanNeeded := conf.Server.Scanner.ScanOnStartup || inProgress || fullScanRequired == "1" || pidHasChanged
+		scanNeeded := conf.Server.Scanner.ScanOnStartup || inProgress || fullScanRequired == "1" || pidHasChanged || biliChanged
 		time.Sleep(2 * time.Second) // Wait 2 seconds before the initial scan
 		if scanNeeded {
 			s := CreateScanner(ctx)
@@ -222,7 +236,61 @@ func runInitialScan(ctx context.Context) func() error {
 		} else {
 			log.Debug(ctx, "Initial scan not needed")
 		}
+		if conf.Server.Bilibili.Enabled {
+			applyBilibiliFavTime(ctx)
+		}
 		return nil
+	}
+}
+
+func schedulePeriodicBilibiliSync(ctx context.Context) func() error {
+	return func() error {
+		if !conf.Server.Bilibili.Enabled {
+			return nil
+		}
+		schedule := conf.Server.Bilibili.SyncSchedule
+		if schedule == "" {
+			log.Info(ctx, "Periodic bilibili sync is DISABLED")
+			return nil
+		}
+
+		syncer := bilibili.NewSyncer()
+		var scannerSvc model.Scanner
+		schedulerInstance := scheduler.GetInstance()
+		log.Info("Scheduling periodic bilibili sync", "schedule", schedule)
+		_, err := schedulerInstance.Add(schedule, func() {
+			result, err := syncer.Sync(ctx)
+			if err != nil {
+				log.Error(ctx, "Error executing periodic bilibili sync", err)
+				return
+			}
+			if !result.Changed {
+				return
+			}
+			if conf.Server.Scanner.Enabled {
+				if scannerSvc == nil {
+					scannerSvc = CreateScanner(ctx)
+				}
+				_, err = scannerSvc.ScanAll(ctx, false)
+				if err != nil {
+					log.Error(ctx, "Error triggering scan after bilibili sync", err)
+					return
+				}
+			}
+			applyBilibiliFavTime(ctx)
+		})
+		return err
+	}
+}
+
+func applyBilibiliFavTime(ctx context.Context) {
+	updated, err := bilibili.SyncDateAddedFromFavTime(ctx)
+	if err != nil {
+		log.Error(ctx, "Failed to sync bilibili fav_time to date added", err)
+		return
+	}
+	if updated > 0 {
+		log.Info(ctx, "Synced bilibili fav_time to date added", "updated", updated)
 	}
 }
 

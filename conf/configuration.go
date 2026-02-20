@@ -104,6 +104,7 @@ type configOptions struct {
 	Spotify                         spotifyOptions      `json:",omitzero"`
 	Deezer                          deezerOptions       `json:",omitzero"`
 	ListenBrainz                    listenBrainzOptions `json:",omitzero"`
+	Bilibili                        bilibiliOptions     `json:",omitzero"`
 	EnableScrobbleHistory           bool
 	Tags                            map[string]TagConf `json:",omitempty"`
 	Agents                          string
@@ -199,6 +200,16 @@ type listenBrainzOptions struct {
 	BaseURL         string
 	ArtistAlgorithm string
 	TrackAlgorithm  string
+}
+
+type bilibiliOptions struct {
+	Enabled         bool
+	Cookies         string //nolint:gosec
+	FavoriteFolders string
+	CacheDir        string
+	SyncSchedule    string
+	SyncOnStartup   bool
+	RequestTimeout  time.Duration
 }
 
 type httpHeaderOptions struct {
@@ -319,6 +330,21 @@ func Load(noConfigDump bool) {
 		}
 	}
 
+	if Server.Bilibili.Enabled {
+		if Server.Bilibili.CacheDir == "" {
+			if strings.Contains(Server.MusicFolder, "://") {
+				Server.Bilibili.CacheDir = filepath.Join(Server.DataFolder, "bilibili-cache")
+			} else {
+				Server.Bilibili.CacheDir = filepath.Join(Server.MusicFolder, ".bilibili-cache")
+			}
+		}
+		err = os.MkdirAll(Server.Bilibili.CacheDir, os.ModePerm)
+		if err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "FATAL: Error creating bilibili cache path:", err)
+			os.Exit(1)
+		}
+	}
+
 	out := os.Stderr
 	if Server.LogFile != "" {
 		out, err = os.OpenFile(Server.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -337,6 +363,7 @@ func Load(noConfigDump bool) {
 	err = run.Sequentially(
 		validateScanSchedule,
 		validateBackupSchedule,
+		validateBilibiliSchedule,
 		validatePlaylistsPath,
 		validatePurgeMissingOption,
 	)
@@ -525,6 +552,16 @@ func validateBackupSchedule() error {
 	return err
 }
 
+func validateBilibiliSchedule() error {
+	if Server.Bilibili.SyncSchedule == "0" || Server.Bilibili.SyncSchedule == "" {
+		Server.Bilibili.SyncSchedule = ""
+		return nil
+	}
+	var err error
+	Server.Bilibili.SyncSchedule, err = validateSchedule(Server.Bilibili.SyncSchedule, "Bilibili.SyncSchedule")
+	return err
+}
+
 func validateSchedule(schedule, field string) (string, error) {
 	if _, err := time.ParseDuration(schedule); err == nil {
 		schedule = "@every " + schedule
@@ -656,6 +693,13 @@ func setViperDefaults() {
 	viper.SetDefault("listenbrainz.baseurl", consts.DefaultListenBrainzBaseURL)
 	viper.SetDefault("listenbrainz.artistalgorithm", consts.DefaultListenBrainzArtistAlgorithm)
 	viper.SetDefault("listenbrainz.trackalgorithm", consts.DefaultListenBrainzTrackAlgorithm)
+	viper.SetDefault("bilibili.enabled", false)
+	viper.SetDefault("bilibili.cookies", "")
+	viper.SetDefault("bilibili.favoritefolders", "")
+	viper.SetDefault("bilibili.cachedir", "")
+	viper.SetDefault("bilibili.syncschedule", "0")
+	viper.SetDefault("bilibili.synconstartup", true)
+	viper.SetDefault("bilibili.requesttimeout", 30*time.Second)
 	viper.SetDefault("enablescrobblehistory", true)
 	viper.SetDefault("httpheaders.frameoptions", "DENY")
 	viper.SetDefault("backup.path", "")

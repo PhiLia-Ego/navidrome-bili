@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/djherbis/times"
+	"github.com/navidrome/navidrome/adapters/bilibili"
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/core/storage"
 	"github.com/navidrome/navidrome/log"
@@ -47,12 +48,13 @@ func (s *localStorage) FS() (storage.MusicFS, error) {
 	if _, err := os.Stat(path); err != nil { //nolint:gosec
 		return nil, fmt.Errorf("%w: %s", err, path)
 	}
-	return &localFS{FS: os.DirFS(path), extractor: s.extractor}, nil
+	return &localFS{FS: os.DirFS(path), extractor: s.extractor, basePath: path}, nil
 }
 
 type localFS struct {
 	fs.FS
 	extractor Extractor
+	basePath  string
 }
 
 func (lfs *localFS) ReadTags(path ...string) (map[string]metadata.Info, error) {
@@ -60,17 +62,53 @@ func (lfs *localFS) ReadTags(path ...string) (map[string]metadata.Info, error) {
 	if err != nil {
 		return nil, err
 	}
-	for path, v := range res {
+	for p, v := range res {
 		if v.FileInfo == nil {
-			info, err := fs.Stat(lfs, path)
+			info, err := fs.Stat(lfs, p)
 			if err != nil {
 				return nil, err
 			}
 			v.FileInfo = localFileInfo{info}
-			res[path] = v
+			res[p] = v
+		}
+	}
+	for _, p := range path {
+		absPath := filepath.Join(lfs.basePath, p)
+		if fallback, ok := bilibili.PlaceholderMetadata(absPath); ok {
+			if current, exists := res[p]; exists {
+				res[p] = mergeWithFallback(current, *fallback)
+				continue
+			}
+			info, err := fs.Stat(lfs, p)
+			if err != nil {
+				return nil, err
+			}
+			fallback.FileInfo = localFileInfo{info}
+			res[p] = *fallback
 		}
 	}
 	return res, nil
+}
+
+func mergeWithFallback(current, fallback metadata.Info) metadata.Info {
+	if current.Tags == nil {
+		current.Tags = map[string][]string{}
+	}
+	for _, k := range []string{"title", "artist", "albumartist", "album"} {
+		if len(current.Tags[k]) == 0 && len(fallback.Tags[k]) > 0 {
+			current.Tags[k] = fallback.Tags[k]
+		}
+	}
+	if current.AudioProperties.Duration <= 0 {
+		current.AudioProperties.Duration = fallback.AudioProperties.Duration
+	}
+	if current.AudioProperties.BitRate <= 0 {
+		current.AudioProperties.BitRate = fallback.AudioProperties.BitRate
+	}
+	if current.FileInfo == nil {
+		current.FileInfo = fallback.FileInfo
+	}
+	return current
 }
 
 // localFileInfo is a wrapper around fs.FileInfo that adds a BirthTime method, to make it compatible

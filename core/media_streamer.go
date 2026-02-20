@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/navidrome/navidrome/adapters/bilibili"
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/consts"
 	"github.com/navidrome/navidrome/core/ffmpeg"
@@ -70,6 +71,9 @@ func (ms *mediaStreamer) DoStream(ctx context.Context, mf *model.MediaFile, reqF
 	format, bitRate = selectTranscodingOptions(ctx, ms.ds, mf, reqFormat, reqBitRate)
 	s := &Stream{ctx: ctx, mf: mf, format: format, bitRate: bitRate}
 	filePath := mf.AbsolutePath()
+	if err := bilibili.EnsureCached(ctx, filePath); err != nil {
+		log.Warn(ctx, "Failed to cache bilibili source on demand", "path", filePath, err)
+	}
 
 	if format == "raw" {
 		log.Debug(ctx, "Streaming RAW file", "id", mf.ID, "path", filePath,
