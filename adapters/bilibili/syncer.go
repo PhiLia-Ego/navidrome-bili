@@ -152,42 +152,38 @@ func (s *syncer) Sync(ctx context.Context) (SyncResult, error) {
 				continue
 			}
 
-			video, err := bc.getVideoInfo(ctx, media.BVID)
-			if err != nil {
-				log.Warn(ctx, "Bilibili sync: failed to fetch video info, skipping media", "bvid", media.BVID, err)
-				continue
+			cid := media.CID
+			if cid == 0 {
+				cid = media.UGC.FirstCID
 			}
-			cid := video.CID
-			if cid == 0 && len(video.Pages) > 0 {
-				cid = video.Pages[0].CID
+			if cid == 0 && hasPrev {
+				cid = prev.CID
 			}
 			if cid == 0 {
-				log.Warn(ctx, "Bilibili sync: no CID found, skipping media", "bvid", media.BVID)
-				continue
-			}
-
-			sources, err := bc.getAudioSources(ctx, media.BVID, cid)
-			if err != nil {
-				log.Warn(ctx, "Bilibili sync: failed to fetch audio sources, skipping media", "bvid", media.BVID, "cid", cid, err)
-				continue
-			}
-			selected := selectBestSources(sources)
-			if len(selected) == 0 {
-				log.Warn(ctx, "Bilibili sync: no selectable audio sources", "bvid", media.BVID, "cid", cid)
+				log.Warn(ctx, "Bilibili sync: no CID from favorite list/state, skipping media", "bvid", media.BVID)
 				continue
 			}
 
 			title := media.Title
-			if title == "" {
-				title = video.Title
+			if title == "" && hasPrev {
+				title = prev.Title
 			}
 			artist := media.Upper.Name
-			if artist == "" {
-				artist = video.Owner.Name
+			if artist == "" && hasPrev {
+				artist = prev.Artist
 			}
 			fidDir := filepath.Join(cacheDir, fmt.Sprintf("fid_%d", t.FID))
 			if err := os.MkdirAll(fidDir, 0755); err != nil {
 				return result, fmt.Errorf("creating fid cache dir: %w", err)
+			}
+
+			targetFile := buildPlaceholderFilename(fidDir, title, artist, media.BVID)
+			if hasPrev && len(prev.Sources) > 0 {
+				targetFile = filepath.Join(cacheDir, prev.Sources[0].File)
+			}
+			if err := ensurePlaceholder(targetFile, false); err != nil {
+				log.Warn(ctx, "Bilibili sync: failed creating placeholder", "path", targetFile, err)
+				continue
 			}
 
 			item := stateItem{
@@ -201,53 +197,21 @@ func (s *syncer) Sync(ctx context.Context) (SyncResult, error) {
 				Duration:    media.Duration,
 				CID:         cid,
 			}
-			for _, src := range selected {
-				targetFile := buildTargetFilename(fidDir, title, artist, media.BVID, src)
-				sourceHash := hashString(fmt.Sprintf("%d|%d|%s", src.ID, src.Bandwidth, src.Codecs))
-				needsPlaceholder := true
-				invalidateCached := false
-				if hasPrev {
-					for _, old := range prev.Sources {
-						if old.Codec == codecFamily(src) {
-							if old.SourceHash == sourceHash {
-								targetFile = filepath.Join(cacheDir, old.File)
-								if _, err := os.Stat(targetFile); err == nil {
-									needsPlaceholder = false
-								}
-							} else {
-								targetFile = filepath.Join(cacheDir, old.File)
-								invalidateCached = true
-							}
-							break
-						}
-					}
-				}
-				if needsPlaceholder || invalidateCached {
-					if err := ensurePlaceholder(targetFile, invalidateCached); err != nil {
-						log.Warn(ctx, "Bilibili sync: failed creating placeholder", "path", targetFile, err)
-						continue
-					}
-					if hasPrev {
-						result.Updated++
-					} else {
-						result.Added++
-					}
-					result.Changed = true
-				} else {
-					result.Skipped++
-				}
-				item.Sources = append(item.Sources, savedSource{
-					Codec:      codecFamily(src),
-					ID:         src.ID,
-					Bandwidth:  src.Bandwidth,
-					Codecs:     src.Codecs,
-					SourceHash: sourceHash,
-					File:       relToCache(cacheDir, targetFile),
-				})
+			item.Sources = []savedSource{{
+				Codec:      "aac",
+				ID:         30280,
+				Bandwidth:  320000,
+				Codecs:     "mp4a.40.2",
+				SourceHash: "pending",
+				File:       relToCache(cacheDir, targetFile),
+			}}
+			if hasPrev {
+				result.Updated++
+			} else {
+				result.Added++
 			}
-			if len(item.Sources) > 0 {
-				newItems[itemKey] = item
-			}
+			result.Changed = true
+			newItems[itemKey] = item
 		}
 	}
 
@@ -339,12 +303,30 @@ func EnsureCached(ctx context.Context, absPath string) error {
 		cookies:    conf.Server.Bilibili.Cookies,
 	}
 
-	allSources, err := bc.getAudioSources(ctx, item.BVID, item.CID)
+	cid := item.CID
+	if cid == 0 {
+		video, err := bc.getVideoInfo(ctx, item.BVID)
+		if err != nil {
+			return err
+		}
+		cid = video.CID
+		if cid == 0 && len(video.Pages) > 0 {
+			cid = video.Pages[0].CID
+		}
+		if cid == 0 {
+			return fmt.Errorf("no CID found for %s", item.BVID)
+		}
+	}
+
+	allSources, err := bc.getAudioSources(ctx, item.BVID, cid)
 	if err != nil {
 		return err
 	}
 	selected := selectBestSources(allSources)
-	target, found := pickByCodec(selected, src.Codec)
+	target, found := pickPrimarySource(selected)
+	if !found {
+		target, found = pickByCodec(selected, src.Codec)
+	}
 	if !found {
 		return fmt.Errorf("no bilibili source available for codec family %s", src.Codec)
 	}
@@ -353,7 +335,50 @@ func EnsureCached(ctx context.Context, absPath string) error {
 		return err
 	}
 	log.Info(ctx, "Bilibili on-demand cache: downloading source", "path", absPath, "codec", src.Codec, "bvid", item.BVID, "stateRoot", rootDir)
-	return bc.downloadFile(ctx, target.BaseURL, absPath)
+	if err := bc.downloadFile(ctx, target.BaseURL, absPath); err != nil {
+		return err
+	}
+
+	updatedSources := make([]savedSource, 0, len(selected))
+	primaryCodec := codecFamily(target)
+	updatedSources = append(updatedSources, savedSource{
+		Codec:      primaryCodec,
+		ID:         target.ID,
+		Bandwidth:  target.Bandwidth,
+		Codecs:     target.Codecs,
+		SourceHash: hashString(fmt.Sprintf("%d|%d|%s", target.ID, target.Bandwidth, target.Codecs)),
+		File:       relToCache(rootDir, absPath),
+	})
+
+	for _, other := range selected {
+		if codecFamily(other) == primaryCodec {
+			continue
+		}
+		otherPath := buildVariantCacheFilename(absPath, item.BVID, codecFamily(other))
+		if err := ensureFileDownloaded(ctx, bc, other.BaseURL, otherPath); err != nil {
+			log.Debug(ctx, "Bilibili on-demand cache: variant cache skipped", "codec", codecFamily(other), "bvid", item.BVID, err)
+			continue
+		}
+		updatedSources = append(updatedSources, savedSource{
+			Codec:      codecFamily(other),
+			ID:         other.ID,
+			Bandwidth:  other.Bandwidth,
+			Codecs:     other.Codecs,
+			SourceHash: hashString(fmt.Sprintf("%d|%d|%s", other.ID, other.Bandwidth, other.Codecs)),
+			File:       relToCache(rootDir, otherPath),
+		})
+	}
+
+	if key, ok := findItemKeyBySourceFile(state, rel); ok {
+		stItem := state.Items[key]
+		stItem.CID = cid
+		stItem.Sources = updatedSources
+		state.Items[key] = stItem
+		if err := saveState(filepath.Join(rootDir, stateFileName), state); err != nil {
+			log.Warn(ctx, "Bilibili on-demand cache: failed to update state", "bvid", item.BVID, err)
+		}
+	}
+	return nil
 }
 
 func PlaceholderMetadata(absPath string) (*metadata.Info, bool) {
@@ -461,6 +486,20 @@ func pickByCodec(sources []audioSource, codec string) (audioSource, bool) {
 	}
 	if len(sources) == 0 {
 		return audioSource{}, false
+	}
+	return sources[0], true
+}
+
+func pickPrimarySource(sources []audioSource) (audioSource, bool) {
+	if len(sources) == 0 {
+		return audioSource{}, false
+	}
+	for _, wanted := range []string{"flac", "lc3", "aac"} {
+		for _, src := range sources {
+			if codecFamily(src) == wanted {
+				return src, true
+			}
+		}
 	}
 	return sources[0], true
 }
@@ -715,6 +754,29 @@ func allSourceFilesExist(cacheDir string, sources []savedSource) bool {
 	return true
 }
 
+func findItemKeyBySourceFile(state *syncState, rel string) (string, bool) {
+	rel = filepath.ToSlash(rel)
+	for key, item := range state.Items {
+		for _, src := range item.Sources {
+			if normPath(filepath.ToSlash(src.File)) == normPath(rel) {
+				return key, true
+			}
+		}
+	}
+	return "", false
+}
+
+func ensureFileDownloaded(ctx context.Context, bc *client, sourceURL, targetPath string) error {
+	info, err := os.Stat(targetPath)
+	if err == nil && info.Size() > 0 {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		return err
+	}
+	return bc.downloadFile(ctx, sourceURL, targetPath)
+}
+
 func parseFavoriteTargets(raw string) ([]favoriteTarget, error) {
 	parts := strings.FieldsFunc(raw, func(r rune) bool {
 		return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
@@ -835,9 +897,13 @@ type favoriteMedia struct {
 	Duration int    `json:"duration"`
 	FavTime  int64  `json:"fav_time"`
 	BVID     string `json:"bvid"`
+	CID      int64  `json:"cid"`
 	Upper    struct {
 		Name string `json:"name"`
 	} `json:"upper"`
+	UGC struct {
+		FirstCID int64 `json:"first_cid"`
+	} `json:"ugc"`
 }
 
 func (c *client) listFavorites(ctx context.Context, mediaID int64) (string, []favoriteMedia, error) {
@@ -857,6 +923,7 @@ func (c *client) listFavorites(ctx context.Context, mediaID int64) (string, []fa
 		if resp.Code != 0 {
 			return "", nil, fmt.Errorf("bilibili list favorites failed: media_id=%d code=%d message=%s", mediaID, resp.Code, resp.Message)
 		}
+		log.Debug(ctx, "Bilibili API: favorites page fetched", "media_id", mediaID, "pn", pn, "count", len(resp.Data.Medias), "hasMore", resp.Data.HasMore)
 		if folderTitle == "" {
 			folderTitle = resp.Data.Info.Title
 		}
@@ -895,6 +962,7 @@ func (c *client) getVideoInfo(ctx context.Context, bvid string) (*videoInfo, err
 	if resp.Code != 0 {
 		return nil, fmt.Errorf("bilibili view failed: bvid=%s code=%d message=%s", bvid, resp.Code, resp.Message)
 	}
+	log.Debug(ctx, "Bilibili API: video info fetched", "bvid", bvid, "cid", resp.Data.CID, "pages", len(resp.Data.Pages))
 	return &resp.Data, nil
 }
 
@@ -984,6 +1052,7 @@ func (c *client) getAudioSources(ctx context.Context, bvid string, cid int64) ([
 		out = append(out, *resp.Data.Dash.Flac.Audio)
 	}
 	out = append(out, resp.Data.Dash.Dolby.Audio...)
+	log.Debug(ctx, "Bilibili API: playurl fetched", "bvid", bvid, "cid", cid, "audioCandidates", len(out))
 	return out, nil
 }
 
@@ -1071,17 +1140,16 @@ func validateDownloadURL(raw string) error {
 	return fmt.Errorf("refusing untrusted source host: %s", host)
 }
 
-func buildTargetFilename(baseDir, title, artist, bvid string, src audioSource) string {
-	ext := "m4a"
-	switch codecFamily(src) {
-	case "flac":
-		ext = "flac"
-	case "lc3":
-		ext = "m4a"
-	}
+func buildPlaceholderFilename(baseDir, title, artist, bvid string) string {
 	name := sanitizeFilename(fmt.Sprintf("%s - %s [%s] [%s].%s",
-		compactTitle(title), compactTitle(artist), bvid, codecFamily(src), ext))
+		compactTitle(title), compactTitle(artist), bvid, "aac", "m4a"))
 	return filepath.Join(baseDir, name)
+}
+
+func buildVariantCacheFilename(primaryPath, bvid, codec string) string {
+	dir := filepath.Dir(primaryPath)
+	base := sanitizeFilename(fmt.Sprintf("%s.%s", bvid, codec))
+	return filepath.Join(dir, "."+base+".ndcache")
 }
 
 func compactTitle(s string) string {
