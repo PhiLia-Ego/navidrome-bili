@@ -1131,6 +1131,7 @@ func validateDownloadURL(raw string) error {
 		".bilivideo.com",
 		".hdslb.com",
 		".mcdn.bilivideo.cn",
+		".akamaized.net",
 	}
 	for _, suffix := range allowedSuffixes {
 		if strings.HasSuffix(host, suffix) {
