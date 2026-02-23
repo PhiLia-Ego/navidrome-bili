@@ -1,6 +1,7 @@
 package bilibili
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -276,7 +277,15 @@ func EnsureCached(ctx context.Context, absPath string) error {
 
 	info, err := os.Stat(absPath)
 	if err == nil && info.Size() > 0 {
-		return nil
+		ok, checkErr := isLikelyAudioCache(absPath)
+		if checkErr != nil {
+			log.Debug(ctx, "Bilibili on-demand cache: failed to validate cached file", "path", absPath, checkErr)
+		}
+		if ok {
+			return nil
+		}
+		log.Warn(ctx, "Bilibili on-demand cache: cached file looks invalid, forcing re-download", "path", absPath, "size", info.Size())
+		_ = os.Remove(absPath)
 	}
 	rootDir, rel, state, err := resolveStateForPath(absPath)
 	if err != nil {
@@ -1075,6 +1084,7 @@ func (c *client) downloadFile(ctx context.Context, sourceURL, targetPath string)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("http %d while downloading source", resp.StatusCode)
 	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 
 	tmp := targetPath + ".tmp"
 	f, err := os.Create(tmp)
@@ -1083,9 +1093,31 @@ func (c *client) downloadFile(ctx context.Context, sourceURL, targetPath string)
 	}
 	defer f.Close()
 
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	head, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
 		_ = os.Remove(tmp)
 		return err
+	}
+	if looksLikeErrorPayload(head, contentType) {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("unexpected non-audio payload while downloading source, content-type=%q", contentType)
+	}
+	if len(head) > 0 {
+		if _, err := f.Write(head); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+
+	written, err := io.Copy(f, resp.Body)
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	totalWritten := int64(len(head)) + written
+	if totalWritten == 0 {
+		_ = os.Remove(tmp)
+		return errors.New("downloaded empty source payload")
 	}
 	if err := f.Close(); err != nil {
 		return err
@@ -1095,6 +1127,44 @@ func (c *client) downloadFile(ctx context.Context, sourceURL, targetPath string)
 		return err
 	}
 	return nil
+}
+
+func looksLikeErrorPayload(head []byte, contentType string) bool {
+	trimmed := bytes.TrimSpace(bytes.ToLower(head))
+	if strings.Contains(contentType, "text/") ||
+		strings.Contains(contentType, "application/json") ||
+		strings.Contains(contentType, "application/xml") ||
+		strings.Contains(contentType, "text/html") {
+		return true
+	}
+	if len(trimmed) == 0 {
+		return true
+	}
+	if bytes.HasPrefix(trimmed, []byte("<!doctype html")) ||
+		bytes.HasPrefix(trimmed, []byte("<html")) ||
+		bytes.HasPrefix(trimmed, []byte("{")) ||
+		bytes.HasPrefix(trimmed, []byte("<?xml")) {
+		return true
+	}
+	return false
+}
+
+func isLikelyAudioCache(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	head := make([]byte, 4096)
+	n, err := f.Read(head)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil
+	}
+	return !looksLikeErrorPayload(head[:n], ""), nil
 }
 
 func buildAPIEndpoint(apiPath string, params url.Values) (string, error) {
