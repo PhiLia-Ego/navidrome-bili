@@ -29,7 +29,7 @@ type PluginManager interface {
 	ValidatePluginConfig(ctx context.Context, id, configJSON string) error
 	UpdatePluginConfig(ctx context.Context, id, configJSON string) error
 	UpdatePluginUsers(ctx context.Context, id, usersJSON string, allUsers bool) error
-	UpdatePluginLibraries(ctx context.Context, id, librariesJSON string, allLibraries bool) error
+	UpdatePluginLibraries(ctx context.Context, id, librariesJSON string, allLibraries, allowWriteAccess bool) error
 	RescanPlugins(ctx context.Context) error
 	UnloadDisabledPlugins(ctx context.Context)
 }
@@ -44,10 +44,11 @@ type Router struct {
 	users         core.User
 	maintenance   core.Maintenance
 	pluginManager PluginManager
+	imgUpload     core.ImageUploadService
 }
 
-func New(ds model.DataStore, share core.Share, playlists playlistsvc.Playlists, insights metrics.Insights, libraryService core.Library, userService core.User, maintenance core.Maintenance, pluginManager PluginManager) *Router {
-	r := &Router{ds: ds, share: share, playlists: playlists, insights: insights, libs: libraryService, users: userService, maintenance: maintenance, pluginManager: pluginManager}
+func New(ds model.DataStore, share core.Share, playlists playlistsvc.Playlists, insights metrics.Insights, libraryService core.Library, userService core.User, maintenance core.Maintenance, pluginManager PluginManager, imgUpload core.ImageUploadService) *Router {
+	r := &Router{ds: ds, share: share, playlists: playlists, insights: insights, libs: libraryService, users: userService, maintenance: maintenance, pluginManager: pluginManager, imgUpload: imgUpload}
 	r.Handler = r.routes()
 	return r
 }
@@ -66,11 +67,11 @@ func (api *Router) routes() http.Handler {
 		api.RX(r, "/user", api.users.NewRepository, true)
 		api.R(r, "/song", model.MediaFile{}, false)
 		api.R(r, "/album", model.Album{}, false)
-		api.R(r, "/artist", model.Artist{}, false)
+		api.addArtistRoute(r)
 		api.R(r, "/genre", model.Genre{}, false)
 		api.R(r, "/player", model.Player{}, true)
 		api.R(r, "/transcoding", model.Transcoding{}, conf.Server.EnableTranscodingConfig)
-		api.R(r, "/radio", model.Radio{}, true)
+		api.addRadioRoute(r)
 		api.R(r, "/tag", model.Tag{}, true)
 		if conf.Server.EnableSharing {
 			api.RX(r, "/share", api.share.NewRepository, true)
@@ -140,6 +141,8 @@ func (api *Router) addPlaylistRoute(r chi.Router) {
 			r.Get("/", rest.Get(constructor))
 			r.Put("/", rest.Put(constructor))
 			r.Delete("/", rest.Delete(constructor))
+			r.Post("/image", uploadPlaylistImage(api.playlists))
+			r.Delete("/image", deletePlaylistImage(api.playlists))
 		})
 	})
 }

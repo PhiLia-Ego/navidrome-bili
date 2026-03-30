@@ -1,6 +1,7 @@
 package persistence
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -81,6 +82,53 @@ var _ = Describe("AlbumRepository", func() {
 			Expect(GetAll(model.QueryOptions{Offset: 1, Max: 1})).To(Equal(model.Albums{
 				albumAbbeyRoad,
 			}))
+		})
+	})
+
+	Describe("recently_added sort", func() {
+		It("sorts correctly regardless of timestamp format (T-format vs space-format)", func() {
+			// Both timestamps share the same date prefix "2024-01-15" so the T vs space
+			// character at position 10 determines sort order in raw string comparison.
+			// Without normalization, 'T' (ASCII 84) > ' ' (ASCII 32) makes the older
+			// T-format timestamp sort AFTER the newer space-format one.
+
+			// Older album: morning of Jan 15, stored in T-format
+			olderAlbum := &model.Album{LibraryID: 1, ID: "ts-older", Name: "Older Album"}
+			Expect(albumRepo.Put(olderAlbum)).To(Succeed())
+			_, err := albumRepo.executeSQL(squirrel.Update("album").
+				Set("created_at", "2024-01-15T08:00:00Z").
+				Where(squirrel.Eq{"id": "ts-older"}))
+			Expect(err).ToNot(HaveOccurred())
+
+			// Newer album: evening of Jan 15, stored in space-format
+			newerAlbum := &model.Album{LibraryID: 1, ID: "ts-newer", Name: "Newer Album"}
+			Expect(albumRepo.Put(newerAlbum)).To(Succeed())
+			_, err = albumRepo.executeSQL(squirrel.Update("album").
+				Set("created_at", "2024-01-15 20:00:00+00:00").
+				Where(squirrel.Eq{"id": "ts-newer"}))
+			Expect(err).ToNot(HaveOccurred())
+
+			albums, err := albumRepo.GetAll(model.QueryOptions{Sort: "recently_added", Order: "desc"})
+			Expect(err).ToNot(HaveOccurred())
+
+			// Find positions of our test albums
+			olderIdx, newerIdx := -1, -1
+			for i, a := range albums {
+				switch a.ID {
+				case "ts-older":
+					olderIdx = i
+				case "ts-newer":
+					newerIdx = i
+				}
+			}
+			Expect(olderIdx).To(BeNumerically(">=", 0), "older album not found in results")
+			Expect(newerIdx).To(BeNumerically(">=", 0), "newer album not found in results")
+			// Newer album (evening, space-format) should come before older album (morning, T-format) in desc order
+			Expect(newerIdx).To(BeNumerically("<", olderIdx),
+				"Newer album (20:00 space-format) should sort before older album (08:00 T-format) in desc order")
+
+			// Clean up
+			_, _ = albumRepo.executeSQL(squirrel.Delete("album").Where(squirrel.Eq{"id": []string{"ts-older", "ts-newer"}}))
 		})
 	})
 
@@ -741,6 +789,46 @@ var _ = Describe("AlbumRepository", func() {
 			// Clean up
 			_, _ = artistRepo.executeSQL(squirrel.Delete("artist").Where(squirrel.Eq{"id": artist.ID}))
 			_, _ = albumRepo.executeSQL(squirrel.Delete("album").Where(squirrel.Eq{"id": album.ID}))
+		})
+	})
+
+	Describe("wrapAlbumCursor", func() {
+		It("does not panic when the cursor yields a dbAlbum with nil Album", func() {
+			// Simulate what queryWithStableResults does on the rows.Err() path:
+			// it yields a zero-value dbAlbum (where Album is nil) with an error.
+			dbErr := fmt.Errorf("database is locked")
+			cursor := func(yield func(dbAlbum, error) bool) {
+				var empty dbAlbum // Album pointer is nil
+				yield(empty, dbErr)
+			}
+
+			// wrapAlbumCursor should handle the nil Album without panicking
+			wrappedCursor := wrapAlbumCursor(cursor)
+			var gotErr error
+			Expect(func() {
+				for _, err := range wrappedCursor {
+					gotErr = err
+				}
+			}).ToNot(Panic())
+			Expect(gotErr).To(HaveOccurred())
+			Expect(gotErr.Error()).To(ContainSubstring("unexpected nil album"))
+			Expect(errors.Is(gotErr, dbErr)).To(BeTrue(), "should wrap the original cursor error")
+		})
+
+		It("yields albums from a valid cursor", func() {
+			album := &model.Album{ID: "a1", Name: "Test"}
+			cursor := func(yield func(dbAlbum, error) bool) {
+				yield(dbAlbum{Album: album}, nil)
+			}
+
+			wrappedCursor := wrapAlbumCursor(cursor)
+			var albums []model.Album
+			for a, err := range wrappedCursor {
+				Expect(err).ToNot(HaveOccurred())
+				albums = append(albums, a)
+			}
+			Expect(albums).To(HaveLen(1))
+			Expect(albums[0].ID).To(Equal("a1"))
 		})
 	})
 })

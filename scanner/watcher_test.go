@@ -27,7 +27,7 @@ var _ = Describe("Watcher", func() {
 		DeferCleanup(configtest.SetupConfig())
 		conf.Server.Scanner.WatcherWait = 50 * time.Millisecond // Short wait for tests
 
-		ctx, cancel = context.WithCancel(context.Background())
+		ctx, cancel = context.WithCancel(GinkgoT().Context())
 		DeferCleanup(cancel)
 
 		lib = &model.Library{
@@ -52,6 +52,15 @@ var _ = Describe("Watcher", func() {
 			libraryWatchers: make(map[int]*libraryWatcherInstance),
 			mainCtx:         ctx,
 		}
+	})
+
+	Describe("Watch before Run", func() {
+		It("returns nil and does not panic when mainCtx is nil", func() {
+			w.mainCtx = nil
+			err := w.Watch(ctx, lib)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(w.libraryWatchers).To(BeEmpty())
+		})
 	})
 
 	Describe("Target Collection and Deduplication", func() {

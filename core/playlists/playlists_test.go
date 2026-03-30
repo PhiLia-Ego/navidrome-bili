@@ -2,7 +2,13 @@ package playlists_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 
+	"github.com/navidrome/navidrome/conf"
+	"github.com/navidrome/navidrome/conf/configtest"
+	"github.com/navidrome/navidrome/core"
 	"github.com/navidrome/navidrome/core/playlists"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/criteria"
@@ -36,7 +42,7 @@ var _ = Describe("Playlists", func() {
 				"pls-1": {ID: "pls-1", Name: "My Playlist", OwnerID: "user-1"},
 			}
 			mockPlsRepo.TracksRepo = mockTracks
-			ps = playlists.NewPlaylists(ds)
+			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
 		})
 
 		It("allows owner to delete their playlist", func() {
@@ -75,7 +81,7 @@ var _ = Describe("Playlists", func() {
 				"pls-smart": {ID: "pls-smart", Name: "Smart", OwnerID: "user-1",
 					Rules: &criteria.Criteria{Expression: criteria.Contains{"title": "test"}}},
 			}
-			ps = playlists.NewPlaylists(ds)
+			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
 		})
 
 		It("creates a new playlist with owner set from context", func() {
@@ -133,7 +139,7 @@ var _ = Describe("Playlists", func() {
 					Rules: &criteria.Criteria{Expression: criteria.Contains{"title": "test"}}},
 			}
 			mockPlsRepo.TracksRepo = mockTracks
-			ps = playlists.NewPlaylists(ds)
+			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
 		})
 
 		It("allows owner to update their playlist", func() {
@@ -196,7 +202,7 @@ var _ = Describe("Playlists", func() {
 				"pls-other": {ID: "pls-other", Name: "Other's", OwnerID: "other-user"},
 			}
 			mockPlsRepo.TracksRepo = mockTracks
-			ps = playlists.NewPlaylists(ds)
+			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
 		})
 
 		It("allows owner to add tracks", func() {
@@ -244,7 +250,7 @@ var _ = Describe("Playlists", func() {
 					Rules: &criteria.Criteria{Expression: criteria.Contains{"title": "test"}}},
 			}
 			mockPlsRepo.TracksRepo = mockTracks
-			ps = playlists.NewPlaylists(ds)
+			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
 		})
 
 		It("allows owner to remove tracks", func() {
@@ -278,7 +284,7 @@ var _ = Describe("Playlists", func() {
 					Rules: &criteria.Criteria{Expression: criteria.Contains{"title": "test"}}},
 			}
 			mockPlsRepo.TracksRepo = mockTracks
-			ps = playlists.NewPlaylists(ds)
+			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
 		})
 
 		It("allows owner to reorder", func() {
@@ -292,6 +298,121 @@ var _ = Describe("Playlists", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
 			err := ps.ReorderTrack(ctx, "pls-smart", 1, 3)
 			Expect(err).To(MatchError(model.ErrNotAuthorized))
+		})
+	})
+
+	Describe("SetImage", func() {
+		var tmpDir string
+
+		BeforeEach(func() {
+			DeferCleanup(configtest.SetupConfig())
+			tmpDir = GinkgoT().TempDir()
+			conf.Server.DataFolder = tmpDir
+
+			mockPlsRepo.Data = map[string]*model.Playlist{
+				"pls-1":     {ID: "pls-1", Name: "My Playlist", OwnerID: "user-1"},
+				"pls-other": {ID: "pls-other", Name: "Other's", OwnerID: "other-user"},
+			}
+			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
+		})
+
+		It("saves image file and updates UploadedImage", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			reader := strings.NewReader("fake image data")
+			err := ps.SetImage(ctx, "pls-1", reader, ".jpg")
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(mockPlsRepo.Last.UploadedImage).To(Equal("pls-1_my_playlist.jpg"))
+			absPath := filepath.Join(tmpDir, "artwork", "playlist", "pls-1_my_playlist.jpg")
+			data, err := os.ReadFile(absPath)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(string(data)).To(Equal("fake image data"))
+		})
+
+		It("removes old image when replacing", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+
+			// Upload first image
+			err := ps.SetImage(ctx, "pls-1", strings.NewReader("first"), ".png")
+			Expect(err).ToNot(HaveOccurred())
+			oldPath := filepath.Join(tmpDir, "artwork", "playlist", "pls-1_my_playlist.png")
+			Expect(oldPath).To(BeAnExistingFile())
+
+			// Upload replacement image
+			err = ps.SetImage(ctx, "pls-1", strings.NewReader("second"), ".jpg")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(oldPath).ToNot(BeAnExistingFile())
+			newPath := filepath.Join(tmpDir, "artwork", "playlist", "pls-1_my_playlist.jpg")
+			Expect(newPath).To(BeAnExistingFile())
+		})
+
+		It("allows admin to set image on any playlist", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "admin-1", IsAdmin: true})
+			err := ps.SetImage(ctx, "pls-other", strings.NewReader("data"), ".jpg")
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("denies non-owner", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "other-user", IsAdmin: false})
+			err := ps.SetImage(ctx, "pls-1", strings.NewReader("data"), ".jpg")
+			Expect(err).To(MatchError(model.ErrNotAuthorized))
+		})
+
+		It("returns error when playlist not found", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			err := ps.SetImage(ctx, "nonexistent", strings.NewReader("data"), ".jpg")
+			Expect(err).To(Equal(model.ErrNotFound))
+		})
+	})
+
+	Describe("RemoveImage", func() {
+		var tmpDir string
+
+		BeforeEach(func() {
+			DeferCleanup(configtest.SetupConfig())
+			tmpDir = GinkgoT().TempDir()
+			conf.Server.DataFolder = tmpDir
+
+			// Create a real image file on disk
+			imgDir := filepath.Join(tmpDir, "artwork", "playlist")
+			Expect(os.MkdirAll(imgDir, 0755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(imgDir, "pls-1.jpg"), []byte("img data"), 0600)).To(Succeed())
+
+			mockPlsRepo.Data = map[string]*model.Playlist{
+				"pls-1":     {ID: "pls-1", Name: "My Playlist", OwnerID: "user-1", UploadedImage: "pls-1.jpg"},
+				"pls-empty": {ID: "pls-empty", Name: "No Cover", OwnerID: "user-1"},
+				"pls-other": {ID: "pls-other", Name: "Other's", OwnerID: "other-user"},
+			}
+			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
+		})
+
+		It("removes file and clears UploadedImage", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			err := ps.RemoveImage(ctx, "pls-1")
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(mockPlsRepo.Last.UploadedImage).To(BeEmpty())
+			absPath := filepath.Join(tmpDir, "artwork", "playlist", "pls-1.jpg")
+			Expect(absPath).ToNot(BeAnExistingFile())
+		})
+
+		It("succeeds even if playlist has no image", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			err := ps.RemoveImage(ctx, "pls-empty")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(mockPlsRepo.Last.UploadedImage).To(BeEmpty())
+		})
+
+		It("denies non-owner", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "other-user", IsAdmin: false})
+			err := ps.RemoveImage(ctx, "pls-1")
+			Expect(err).To(MatchError(model.ErrNotAuthorized))
+		})
+
+		It("returns error when playlist not found", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			err := ps.RemoveImage(ctx, "nonexistent")
+			Expect(err).To(Equal(model.ErrNotFound))
 		})
 	})
 })

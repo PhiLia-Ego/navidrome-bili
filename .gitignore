@@ -39,3 +39,4 @@ AGENTS.md
 openspec/
 go.work*
 *.log
+.worktrees/

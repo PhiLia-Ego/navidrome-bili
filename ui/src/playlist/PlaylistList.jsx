@@ -19,6 +19,7 @@ import Switch from '@material-ui/core/Switch'
 import { makeStyles } from '@material-ui/core/styles'
 import { useMediaQuery } from '@material-ui/core'
 import {
+  CoverArtAvatar,
   DurationField,
   List,
   Writable,
@@ -155,7 +156,9 @@ const PlaylistList = (props) => {
         <TogglePublicInput source="public" sortByOrder={'DESC'} />
       ),
       comment: <TextField source="comment" />,
-      sync: <ToggleAutoImport source="sync" sortByOrder={'DESC'} />,
+      sync: !isXsmall && (
+        <ToggleAutoImport source="sync" sortByOrder={'DESC'} />
+      ),
     }),
     [isDesktop, isXsmall],
   )
@@ -176,6 +179,7 @@ const PlaylistList = (props) => {
       bulkActionButtons={!isXsmall && <PlaylistListBulkActions />}
     >
       <Datagrid rowClick="show" isRowSelectable={(r) => isWritable(r?.ownerId)}>
+        <CoverArtAvatar source="id" variant="square" />
         <TextField source="name" />
         {columns}
         <Writable>

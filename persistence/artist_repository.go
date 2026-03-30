@@ -4,15 +4,17 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"time"
 
 	. "github.com/Masterminds/squirrel"
 	"github.com/deluan/rest"
-	"github.com/google/uuid"
 	"github.com/navidrome/navidrome/conf"
+	"github.com/navidrome/navidrome/consts"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/utils"
@@ -135,6 +137,7 @@ func NewArtistRepository(ctx context.Context, db dbx.Builder) model.ArtistReposi
 		"id":         idFilter(r.tableName),
 		"name":       fullTextFilter(r.tableName, "mbz_artist_id"),
 		"starred":    annotationBoolFilter("starred"),
+		"has_rating": annotationBoolFilter("rating"),
 		"role":       roleFilter,
 		"missing":    booleanFilter,
 		"library_id": artistLibraryIdFilter,
@@ -315,13 +318,38 @@ func (r *artistRepository) GetIndex(includeMissing bool, libraryIds []int, roles
 }
 
 func (r *artistRepository) purgeEmpty() error {
-	del := Delete(r.tableName).Where("id not in (select artist_id from album_artists)")
+	orphanFilter := "id not in (select artist_id from album_artists)"
+
+	// Collect uploaded image filenames before deleting
+	sel := Select("uploaded_image").From(r.tableName).
+		Where(orphanFilter).
+		Where("uploaded_image != ''")
+	var imageFiles []string
+	if err := r.queryAllSlice(sel, &imageFiles); err != nil && !errors.Is(err, model.ErrNotFound) {
+		return fmt.Errorf("collecting artist images for cleanup: %w", err)
+	}
+
+	// Delete orphan artists
+	del := Delete(r.tableName).Where(orphanFilter)
 	c, err := r.executeSQL(del)
 	if err != nil {
 		return fmt.Errorf("purging empty artists: %w", err)
 	}
 	if c > 0 {
 		log.Debug(r.ctx, "Purged empty artists", "totalDeleted", c)
+	}
+
+	if len(imageFiles) == 0 {
+		return nil
+	}
+
+	// Best-effort cleanup of uploaded image files
+	log.Debug(r.ctx, "Cleaning up artist images", "totalImages", len(imageFiles))
+	for _, filename := range imageFiles {
+		path := model.UploadedImagePath(consts.EntityArtist, filename)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Warn(r.ctx, "Failed to remove artist image during GC", "path", path, err)
+		}
 	}
 	return nil
 }
@@ -513,20 +541,25 @@ func (r *artistRepository) RefreshStats(allArtists bool) (int64, error) {
 	return totalRowsAffected, nil
 }
 
-func (r *artistRepository) Search(q string, offset int, size int, options ...model.QueryOptions) (model.Artists, error) {
-	var res dbArtists
-	if uuid.Validate(q) == nil {
-		err := r.searchByMBID(r.selectArtist(options...), q, []string{"mbz_artist_id"}, &res)
-		if err != nil {
-			return nil, fmt.Errorf("searching artist by MBID %q: %w", q, err)
-		}
-	} else {
+func (r *artistRepository) searchCfg() searchConfig {
+	return searchConfig{
 		// Natural order for artists is more performant by ID, due to GROUP BY clause in selectArtist
-		err := r.doSearch(r.selectArtist(options...), q, offset, size, &res, "artist.id",
-			"sum(json_extract(stats, '$.total.m')) desc", "name")
-		if err != nil {
-			return nil, fmt.Errorf("searching artist by query %q: %w", q, err)
-		}
+		NaturalOrder:  "artist.id",
+		OrderBy:       []string{"sum(json_extract(stats, '$.total.m')) desc", "name"},
+		MBIDFields:    []string{"mbz_artist_id"},
+		LibraryFilter: r.applyLibraryFilterToArtistQuery,
+	}
+}
+
+func (r *artistRepository) Search(q string, options ...model.QueryOptions) (model.Artists, error) {
+	var opts model.QueryOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	var res dbArtists
+	err := r.doSearch(r.selectArtist(options...), q, &res, r.searchCfg(), opts)
+	if err != nil {
+		return nil, fmt.Errorf("searching artist %q: %w", q, err)
 	}
 	return res.toModels(), nil
 }

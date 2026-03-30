@@ -2,6 +2,7 @@ package conf_test
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -24,6 +25,11 @@ var _ = Describe("Configuration", func() {
 		viper.SetDefault("datafolder", GinkgoT().TempDir())
 		viper.SetDefault("loglevel", "error")
 		conf.ResetConf()
+
+		// Panic instead of exiting on fatal errors to allow testing error conditions
+		DeferCleanup(conf.SetLogFatal(func(args ...any) {
+			panic(fmt.Sprint(args...))
+		}))
 	})
 
 	Describe("ParseLanguages", func() {
@@ -52,6 +58,48 @@ var _ = Describe("Configuration", func() {
 		})
 	})
 
+	Describe("ValidateURL", func() {
+		It("accepts a valid http URL", func() {
+			fn := conf.ValidateURL("TestOption", "http://example.com/path")
+			Expect(fn()).To(Succeed())
+		})
+
+		It("accepts a valid https URL", func() {
+			fn := conf.ValidateURL("TestOption", "https://example.com/path")
+			Expect(fn()).To(Succeed())
+		})
+
+		It("rejects a URL with no scheme", func() {
+			fn := conf.ValidateURL("TestOption", "example.com/path")
+			Expect(fn()).To(MatchError(ContainSubstring("invalid scheme")))
+		})
+
+		It("rejects a URL with an unsupported scheme", func() {
+			fn := conf.ValidateURL("TestOption", "javascript://example.com/path")
+			Expect(fn()).To(MatchError(ContainSubstring("invalid scheme")))
+		})
+
+		It("accepts an empty URL (optional config)", func() {
+			fn := conf.ValidateURL("TestOption", "")
+			Expect(fn()).To(Succeed())
+		})
+
+		It("includes the option name in the error message", func() {
+			fn := conf.ValidateURL("MyOption", "ftp://example.com")
+			Expect(fn()).To(MatchError(ContainSubstring("MyOption")))
+		})
+
+		It("rejects a URL that cannot be parsed", func() {
+			fn := conf.ValidateURL("TestOption", "://invalid")
+			Expect(fn()).To(HaveOccurred())
+		})
+
+		It("rejects a URL without a host", func() {
+			fn := conf.ValidateURL("TestOption", "http:///path")
+			Expect(fn()).To(MatchError(ContainSubstring("non-empty host is required")))
+		})
+	})
+
 	DescribeTable("NormalizeSearchBackend",
 		func(input, expected string) {
 			Expect(conf.NormalizeSearchBackend(input)).To(Equal(expected))
@@ -65,6 +113,111 @@ var _ = Describe("Configuration", func() {
 		Entry("falls back to 'fts' for unrecognized values", "invalid", "fts"),
 		Entry("falls back to 'fts' for empty string", "", "fts"),
 	)
+
+	DescribeTable("ToPascalCase",
+		func(input, expected string) {
+			Expect(conf.ToPascalCase(input)).To(Equal(expected))
+		},
+		Entry("simple key", "address", "Address"),
+		Entry("dotted key", "scanner.schedule", "Scanner.Schedule"),
+		Entry("already capitalized", "Address", "Address"),
+		Entry("multi-segment", "lastfm.enabled", "Lastfm.Enabled"),
+		Entry("empty string", "", ""),
+	)
+
+	Describe("remapEnvVarKeysFromConfig", func() {
+		BeforeEach(func() {
+			viper.Reset()
+			conf.SetViperDefaults()
+			viper.SetDefault("datafolder", GinkgoT().TempDir())
+			viper.SetDefault("loglevel", "error")
+			conf.ResetConf()
+		})
+
+		It("remaps ND_-prefixed keys to canonical keys", func() {
+			filename := filepath.Join("testdata", "cfg_nd_keys.toml")
+			conf.InitConfig(filename, false)
+			conf.Load(true)
+
+			Expect(conf.Server.Address).To(Equal("127.0.0.1"))
+			Expect(conf.Server.Port).To(Equal(4531))
+			Expect(conf.Server.Scanner.Schedule).To(Equal("@every 1h"))
+		})
+
+		It("exits with fatal error when both ND_ and canonical key exist", func() {
+			filename := filepath.Join("testdata", "cfg_nd_conflict.toml")
+			conf.InitConfig(filename, false)
+
+			Expect(func() { conf.Load(true) }).To(PanicWith(And(
+				ContainSubstring("ND_ADDRESS"),
+				ContainSubstring("Address"),
+				ContainSubstring("only needed for environment variables"),
+			)))
+		})
+
+		It("does nothing when no ND_ keys are present", func() {
+			filename := filepath.Join("testdata", "cfg.toml")
+			conf.InitConfig(filename, false)
+			conf.Load(true)
+
+			// Verify normal config loading still works
+			Expect(conf.Server.MusicFolder).To(Equal("/toml/music"))
+		})
+	})
+
+	Describe("logFatal", func() {
+		var invalidPath string
+		BeforeEach(func() {
+			viper.Reset()
+			conf.SetViperDefaults()
+			viper.SetDefault("loglevel", "error")
+			conf.ResetConf()
+
+			// Create a file so that any path under it is invalid on all OSes
+			f, err := os.CreateTemp(GinkgoT().TempDir(), "blocker")
+			Expect(err).ToNot(HaveOccurred())
+			f.Close()
+			invalidPath = filepath.Join(f.Name(), "subdir")
+		})
+
+		It("is called when LoadFromFile gets an invalid config file", func() {
+			Expect(func() {
+				conf.LoadFromFile(filepath.Join(invalidPath, "file.toml"))
+			}).To(PanicWith(ContainSubstring("Error reading config file")))
+		})
+
+		It("is called when DataFolder is not writable", func() {
+			viper.SetDefault("datafolder", invalidPath)
+			Expect(func() {
+				conf.Load(true)
+			}).To(PanicWith(ContainSubstring("Error creating data path")))
+		})
+
+		It("is called when CacheFolder is not writable", func() {
+			viper.SetDefault("datafolder", GinkgoT().TempDir())
+			viper.SetDefault("cachefolder", invalidPath)
+			Expect(func() {
+				conf.Load(true)
+			}).To(PanicWith(ContainSubstring("Error creating cache path")))
+		})
+
+		It("is called when LogFile path is not writable", func() {
+			viper.SetDefault("datafolder", GinkgoT().TempDir())
+			viper.SetDefault("logfile", filepath.Join(invalidPath, "log.txt"))
+			Expect(func() {
+				conf.Load(true)
+			}).To(PanicWith(ContainSubstring("Error opening log file")))
+		})
+
+		It("is called when BaseURL is invalid", func() {
+			viper.SetDefault("datafolder", GinkgoT().TempDir())
+			viper.SetDefault("baseurl", "://invalid")
+			Expect(func() {
+				conf.Load(true)
+			}).To(PanicWith(ContainSubstring("Invalid BaseURL")))
+		})
+
+	})
 
 	DescribeTable("should load configuration from",
 		func(format string) {

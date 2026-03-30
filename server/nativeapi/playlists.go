@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -223,4 +224,18 @@ func getSongPlaylists(svc playlists.Playlists) http.HandlerFunc {
 		}
 		_, _ = w.Write(data) //nolint:gosec
 	}
+}
+
+func uploadPlaylistImage(pls playlists.Playlists) http.HandlerFunc {
+	return handleImageUpload(func(ctx context.Context, reader io.Reader, ext string) error {
+		playlistId := chi.URLParamFromCtx(ctx, "id")
+		return pls.SetImage(ctx, playlistId, reader, ext)
+	})
+}
+
+func deletePlaylistImage(pls playlists.Playlists) http.HandlerFunc {
+	return handleImageDelete(func(ctx context.Context) error {
+		playlistId := chi.URLParamFromCtx(ctx, "id")
+		return pls.RemoveImage(ctx, playlistId)
+	})
 }

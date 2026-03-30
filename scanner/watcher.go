@@ -48,7 +48,7 @@ func GetWatcher(ds model.DataStore, s model.Scanner) Watcher {
 			ds:              ds,
 			scanner:         s,
 			triggerWait:     conf.Server.Scanner.WatcherWait,
-			watcherNotify:   make(chan scanNotification, 1),
+			watcherNotify:   make(chan scanNotification, 500),
 			libraryWatchers: make(map[int]*libraryWatcherInstance),
 		}
 	})
@@ -145,6 +145,12 @@ func (w *watcher) Watch(ctx context.Context, lib *model.Library) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// If Run() hasn't been called yet, mainCtx will be nil - skip watching
+	if w.mainCtx == nil {
+		log.Debug(ctx, "Watcher not started yet, skipping watch for library", "libraryID", lib.ID, "name", lib.Name)
+		return nil
+	}
+
 	// Stop existing watcher if any
 	if existingInstance, exists := w.libraryWatchers[lib.ID]; exists {
 		log.Debug(ctx, "Stopping existing watcher before starting new one", "libraryID", lib.ID, "name", lib.Name)
@@ -152,7 +158,7 @@ func (w *watcher) Watch(ctx context.Context, lib *model.Library) error {
 	}
 
 	// Start new watcher
-	watcherCtx, cancel := context.WithCancel(w.mainCtx)
+	watcherCtx, cancel := context.WithCancel(w.mainCtx) //nolint:gosec // cancel is stored in instance and called on shutdown
 	instance := &libraryWatcherInstance{
 		library: lib,
 		cancel:  cancel,
@@ -266,12 +272,8 @@ func (w *watcher) processLibraryEvents(ctx context.Context, lib *model.Library, 
 				continue
 			}
 
-			// Notify the main watcher of changes
-			select {
-			case w.watcherNotify <- scanNotification{Library: lib, FolderPath: folderPath}:
-			default:
-				// Channel is full, notification already pending
-			}
+			// Notify the main watcher of changes. This will trigger a scan after the debounce period.
+			w.watcherNotify <- scanNotification{Library: lib, FolderPath: folderPath}
 		}
 	}
 }

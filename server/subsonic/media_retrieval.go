@@ -10,7 +10,6 @@ import (
 
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/consts"
-	"github.com/navidrome/navidrome/core/lyrics"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/resources"
@@ -82,7 +81,7 @@ func (api *Router) GetCoverArt(w http.ResponseWriter, r *http.Request) (*respons
 
 	defer imgReader.Close()
 	w.Header().Set("cache-control", "public, max-age=315360000")
-	w.Header().Set("last-modified", lastUpdate.Format(time.RFC1123))
+	w.Header().Set("last-modified", lastUpdate.Format(http.TimeFormat))
 
 	cnt, err := io.Copy(w, imgReader)
 	if err != nil {
@@ -109,7 +108,7 @@ func (api *Router) GetLyrics(r *http.Request) (*responses.Subsonic, error) {
 		return response, nil
 	}
 
-	structuredLyrics, err := lyrics.GetLyrics(r.Context(), &mediaFiles[0])
+	structuredLyrics, err := api.lyrics.GetLyrics(r.Context(), &mediaFiles[0])
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +141,7 @@ func (api *Router) GetLyricsBySongId(r *http.Request) (*responses.Subsonic, erro
 		return nil, err
 	}
 
-	structuredLyrics, err := lyrics.GetLyrics(r.Context(), mediaFile)
+	structuredLyrics, err := api.lyrics.GetLyrics(r.Context(), mediaFile)
 	if err != nil {
 		return nil, err
 	}

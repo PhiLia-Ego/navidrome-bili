@@ -3,6 +3,7 @@ package playlists
 import (
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/deluan/rest"
 	"github.com/navidrome/navidrome/conf"
+	"github.com/navidrome/navidrome/consts"
+	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 )
@@ -34,6 +37,10 @@ type Playlists interface {
 	RemoveTracks(ctx context.Context, playlistID string, trackIds []string) error
 	ReorderTrack(ctx context.Context, playlistID string, pos int, newPos int) error
 
+	// Cover art
+	SetImage(ctx context.Context, playlistID string, reader io.Reader, ext string) error
+	RemoveImage(ctx context.Context, playlistID string) error
+
 	// Import
 	ImportFile(ctx context.Context, folder *model.Folder, filename string) (*model.Playlist, error)
 	ImportM3U(ctx context.Context, reader io.Reader) (*model.Playlist, error)
@@ -43,12 +50,20 @@ type Playlists interface {
 	TracksRepository(ctx context.Context, playlistId string, refreshSmartPlaylist bool) rest.Repository
 }
 
-type playlists struct {
-	ds model.DataStore
+// ImageUploadService is a local interface satisfied by core.ImageUploadService.
+// Defined here to avoid an import cycle between core and core/playlists.
+type ImageUploadService interface {
+	SetImage(ctx context.Context, entityType string, entityID string, name string, oldPath string, reader io.Reader, ext string) (filename string, err error)
+	RemoveImage(ctx context.Context, path string) error
 }
 
-func NewPlaylists(ds model.DataStore) Playlists {
-	return &playlists{ds: ds}
+type playlists struct {
+	ds        model.DataStore
+	imgUpload ImageUploadService
+}
+
+func NewPlaylists(ds model.DataStore, imgUpload ImageUploadService) Playlists {
+	return &playlists{ds: ds, imgUpload: imgUpload}
 }
 
 func InPath(folder model.Folder) bool {
@@ -118,9 +133,18 @@ func (s *playlists) Create(ctx context.Context, playlistId string, name string, 
 }
 
 func (s *playlists) Delete(ctx context.Context, id string) error {
-	if _, err := s.checkWritable(ctx, id); err != nil {
+	pls, err := s.checkWritable(ctx, id)
+	if err != nil {
 		return err
 	}
+
+	// Clean up custom cover image file if one exists
+	if path := pls.UploadedImagePath(); path != "" {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Warn(ctx, "Failed to remove playlist image on delete", "path", path, err)
+		}
+	}
+
 	return s.ds.Playlist(ctx).Delete(id)
 }
 
@@ -262,4 +286,36 @@ func (s *playlists) ReorderTrack(ctx context.Context, playlistID string, pos int
 	return s.ds.WithTx(func(tx model.DataStore) error {
 		return tx.Playlist(ctx).Tracks(playlistID, false).Reorder(pos, newPos)
 	})
+}
+
+// --- Cover art operations ---
+
+func (s *playlists) SetImage(ctx context.Context, playlistID string, reader io.Reader, ext string) error {
+	pls, err := s.checkWritable(ctx, playlistID)
+	if err != nil {
+		return err
+	}
+
+	oldPath := pls.UploadedImagePath()
+	filename, err := s.imgUpload.SetImage(ctx, consts.EntityPlaylist, pls.ID, pls.Name, oldPath, reader, ext)
+	if err != nil {
+		return err
+	}
+
+	pls.UploadedImage = filename
+	return s.ds.Playlist(ctx).Put(pls)
+}
+
+func (s *playlists) RemoveImage(ctx context.Context, playlistID string) error {
+	pls, err := s.checkWritable(ctx, playlistID)
+	if err != nil {
+		return err
+	}
+
+	if err := s.imgUpload.RemoveImage(ctx, pls.UploadedImagePath()); err != nil {
+		return err
+	}
+
+	pls.UploadedImage = ""
+	return s.ds.Playlist(ctx).Put(pls)
 }

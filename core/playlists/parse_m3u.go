@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/utils/slice"
@@ -30,8 +31,12 @@ func (s *playlists) parseM3U(ctx context.Context, pls *model.Playlist, folder *m
 		filteredLines := make([]string, 0, len(lines))
 		for _, line := range lines {
 			line := strings.TrimSpace(line)
-			if strings.HasPrefix(line, "#PLAYLIST:") {
-				pls.Name = line[len("#PLAYLIST:"):]
+			if after, ok := strings.CutPrefix(line, "#PLAYLIST:"); ok {
+				pls.Name = after
+				continue
+			}
+			if after, ok := strings.CutPrefix(line, "#EXTALBUMARTURL:"); ok {
+				pls.ExternalImageURL = resolveImageURL(after, folder, resolver.matcher)
 				continue
 			}
 			// Skip empty lines and extended info
@@ -40,7 +45,7 @@ func (s *playlists) parseM3U(ctx context.Context, pls *model.Playlist, folder *m
 			}
 			if after, ok := strings.CutPrefix(line, "file://"); ok {
 				line = after
-				line, _ = url.QueryUnescape(line)
+				line, _ = url.PathUnescape(line)
 			}
 			if !model.IsAudioFile(line) {
 				continue
@@ -266,4 +271,54 @@ func (r *pathResolver) resolvePaths(ctx context.Context, folder *model.Folder, l
 	}
 
 	return results, nil
+}
+
+// resolveImageURL resolves an #EXTALBUMARTURL value to a storable string.
+// HTTP(S) URLs are stored as-is (gated by EnableM3UExternalAlbumArt).
+// Local paths (file://, absolute, or relative) are resolved to an absolute path
+// and validated against known library boundaries via matcher.
+func resolveImageURL(value string, folder *model.Folder, matcher *libraryMatcher) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+
+	// HTTP(S) URLs — store as-is, but only if external album art is enabled
+	if strings.HasPrefix(value, "http://") || strings.HasPrefix(value, "https://") {
+		if !conf.Server.EnableM3UExternalAlbumArt {
+			return ""
+		}
+		return value
+	}
+
+	// Resolve to local absolute path
+	localPath, ok := resolveLocalPath(value, folder)
+	if !ok {
+		return ""
+	}
+
+	// Validate path is within a known library
+	if libID, _ := matcher.findLibraryForPath(localPath); libID == 0 {
+		return ""
+	}
+	return localPath
+}
+
+// resolveLocalPath converts a file://, absolute, or relative path to a clean absolute path.
+// Returns ("", false) if the path cannot be resolved.
+func resolveLocalPath(value string, folder *model.Folder) (string, bool) {
+	if after, ok := strings.CutPrefix(value, "file://"); ok {
+		decoded, err := url.PathUnescape(after)
+		if err != nil {
+			return "", false
+		}
+		return filepath.Clean(decoded), true
+	}
+	if filepath.IsAbs(value) {
+		return filepath.Clean(value), true
+	}
+	if folder == nil {
+		return "", false
+	}
+	return filepath.Clean(filepath.Join(folder.AbsolutePath(), value)), true
 }
