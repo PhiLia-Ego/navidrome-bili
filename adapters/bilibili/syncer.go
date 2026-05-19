@@ -237,7 +237,7 @@ func (s *syncer) Sync(ctx context.Context) (SyncResult, error) {
 func resolveCacheDir() string {
 	cacheDir := conf.Server.Bilibili.CacheDir
 	if cacheDir == "" {
-		return filepath.Join(conf.Server.DataFolder, "bilibili-cache")
+		return filepath.Join(conf.Server.DataFolder.String(), "bilibili-cache")
 	}
 	return cacheDir
 }

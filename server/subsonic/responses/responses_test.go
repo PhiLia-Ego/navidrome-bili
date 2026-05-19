@@ -1,8 +1,3 @@
-//go:build unix
-
-// TODO Fix snapshot tests in Windows
-// Response Snapshot tests. Only run in Linux and macOS, as they fail in Windows
-// Probably because of EOL char differences
 package responses_test
 
 import (
@@ -229,6 +224,7 @@ var _ = Describe("Responses", func() {
 					Isrc: []string{"ISRC-1", "ISRC-2"},
 					BPM:  127, ChannelCount: 2, SamplingRate: 44100, BitDepth: 16,
 					Moods:         []string{"happy", "sad"},
+					Groupings:     []string{"Soundtrack", "Live"},
 					ReplayGain:    ReplayGain{TrackGain: gg.P(1.0), AlbumGain: gg.P(2.0), TrackPeak: gg.P(3.0), AlbumPeak: gg.P(4.0), BaseGain: gg.P(5.0), FallbackGain: gg.P(6.0)},
 					DisplayArtist: "artist 1 & artist 2",
 					Artists: []ArtistID3Ref{
@@ -325,6 +321,7 @@ var _ = Describe("Responses", func() {
 					Comment: "a comment", MediaType: MediaTypeSong, MusicBrainzId: "4321", SortName: "sorted song",
 					Isrc:       []string{"ISRC-1"},
 					Moods:      []string{"happy", "sad"},
+					Groupings:  []string{"Soundtrack", "Live"},
 					ReplayGain: ReplayGain{TrackGain: gg.P(1.0), AlbumGain: gg.P(2.0), TrackPeak: gg.P(3.0), AlbumPeak: gg.P(4.0), BaseGain: gg.P(5.0), FallbackGain: gg.P(6.0)},
 					BPM:        127, ChannelCount: 2, SamplingRate: 44100, BitDepth: 16,
 					DisplayArtist: "artist1 & artist2",
@@ -429,6 +426,7 @@ var _ = Describe("Responses", func() {
 						ItemGenre{Name: "Genre 2"},
 					},
 					Moods:         []string{"mood1", "mood2"},
+					Groupings:     []string{"Soundtrack"},
 					DisplayArtist: "Display artist",
 					Artists: Array[ArtistID3Ref]{
 						ArtistID3Ref{Id: "artist-1", Name: "Artist 1"},
@@ -1105,6 +1103,71 @@ var _ = Describe("Responses", func() {
 				}
 			})
 
+			It("should match .XML", func() {
+				Expect(xml.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+			It("should match .JSON", func() {
+				Expect(json.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+		})
+	})
+
+	Describe("NowPlaying", func() {
+		BeforeEach(func() {
+			response.NowPlaying = &NowPlaying{}
+		})
+
+		Describe("without data", func() {
+			It("should match .XML", func() {
+				Expect(xml.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+			It("should match .JSON", func() {
+				Expect(json.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+		})
+
+		Describe("with data", func() {
+			BeforeEach(func() {
+				response.NowPlaying.Entry = []NowPlayingEntry{{
+					Child:        Child{Id: "1", Title: "Song", IsDir: false},
+					UserName:     "testuser",
+					MinutesAgo:   2,
+					PlayerId:     1,
+					PlayerName:   "TestPlayer",
+					State:        "playing",
+					PositionMs:   120000,
+					PlaybackRate: 1.5,
+				}}
+			})
+			It("should match .XML", func() {
+				Expect(xml.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+			It("should match .JSON", func() {
+				Expect(json.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+		})
+	})
+
+	Describe("SonicMatches", func() {
+		Context("without data", func() {
+			BeforeEach(func() {
+				response.SonicMatches = &Array[SonicMatch]{}
+			})
+			It("should match .XML", func() {
+				Expect(xml.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+			It("should match .JSON", func() {
+				Expect(json.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
+			})
+		})
+
+		Context("with data", func() {
+			BeforeEach(func() {
+				response.SonicMatches = &Array[SonicMatch]{
+					{Entry: Child{Id: "1", Title: "Bohemian Rhapsody", IsDir: false}, Similarity: 0.95},
+					{Entry: Child{Id: "2", Title: "We Will Rock You", IsDir: false}, Similarity: 0.78},
+				}
+			})
 			It("should match .XML", func() {
 				Expect(xml.MarshalIndent(response, "", "  ")).To(MatchSnapshot())
 			})

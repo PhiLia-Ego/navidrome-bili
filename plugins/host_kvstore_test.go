@@ -34,7 +34,7 @@ var _ = Describe("KVStoreService", func() {
 		Expect(err).ToNot(HaveOccurred())
 
 		DeferCleanup(configtest.SetupConfig())
-		conf.Server.DataFolder = tmpDir
+		conf.Server.DataFolder = conf.NewDir(tmpDir)
 
 		// Create service with 1KB limit for testing
 		maxSize := "1KB"
@@ -445,6 +445,36 @@ var _ = Describe("KVStoreService", func() {
 		})
 	})
 
+	Describe("Close", func() {
+		It("does not race with cleanupLoop goroutine", func() {
+			// Create a service with a dedicated context so we can verify
+			// that Close() properly waits for the cleanup goroutine.
+			closeCtx, closeCancel := context.WithCancel(ctx)
+			defer closeCancel()
+
+			maxSize := "1KB"
+			svc, err := newKVStoreService(closeCtx, "test_close_race", &KVStorePermission{MaxSize: &maxSize})
+			Expect(err).ToNot(HaveOccurred())
+
+			// Insert an expired key so cleanup has work to do
+			_, err = svc.db.Exec(`
+				INSERT INTO kvstore (key, value, size, expires_at)
+				VALUES ('cleanup_race', 'old', 3, datetime('now', '-1 seconds'))
+			`)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Close should not panic or produce "database is closed" errors.
+			// Before the fix, the cleanup goroutine could race with db.Close().
+			err = svc.Close()
+			Expect(err).ToNot(HaveOccurred())
+
+			// Verify the database is actually closed (further queries should fail)
+			_, err = svc.db.Exec(`SELECT 1`)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("database is closed"))
+		})
+	})
+
 	Describe("SetWithTTL", func() {
 		It("stores value that is retrievable before expiry", func() {
 			err := service.SetWithTTL(ctx, "ttl_key", []byte("ttl_value"), 3600)
@@ -675,9 +705,9 @@ var _ = Describe("KVStoreService Integration", Ordered, func() {
 		// Setup config
 		DeferCleanup(configtest.SetupConfig())
 		conf.Server.Plugins.Enabled = true
-		conf.Server.Plugins.Folder = tmpDir
+		conf.Server.Plugins.Folder = conf.NewDir(tmpDir)
 		conf.Server.Plugins.AutoReload = false
-		conf.Server.DataFolder = tmpDir
+		conf.Server.DataFolder = conf.NewDir(tmpDir)
 
 		// Setup mock DataStore with pre-enabled plugin
 		mockPluginRepo := tests.CreateMockPluginRepo()
