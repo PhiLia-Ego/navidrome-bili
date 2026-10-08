@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -55,13 +56,25 @@ func (s *localStorage) FS() (storage.MusicFS, error) {
 	if _, err := os.Stat(path); err != nil { //nolint:gosec
 		return nil, fmt.Errorf("%w: %s", err, path)
 	}
-	return &localFS{FS: os.DirFS(path), extractor: s.extractor, basePath: path}, nil
+	return &localFS{FS: os.DirFS(path), extractor: s.extractor, root: path}, nil
 }
 
 type localFS struct {
 	fs.FS
 	extractor Extractor
-	basePath  string
+	root      string
+	// devices whose statx never reports a birth time (NFS, rclone/FUSE), so we ask each only once
+	noBirthTime sync.Map
+}
+
+// ResolveSymlink implements storage.SymlinkResolverFS. It resolves the whole chain at the
+// OS level, so links whose targets live outside the library folder (not reachable through
+// the fs.FS abstraction) still resolve to their final target.
+func (lfs *localFS) ResolveSymlink(name string) (string, error) {
+	if !fs.ValidPath(name) {
+		return "", &fs.PathError{Op: "resolvesymlink", Path: name, Err: fs.ErrInvalid}
+	}
+	return filepath.EvalSymlinks(filepath.Join(lfs.root, filepath.FromSlash(name)))
 }
 
 func (lfs *localFS) ReadTags(path ...string) (map[string]metadata.Info, error) {
@@ -69,18 +82,25 @@ func (lfs *localFS) ReadTags(path ...string) (map[string]metadata.Info, error) {
 	if err != nil {
 		return nil, err
 	}
+	if res == nil {
+		res = make(map[string]metadata.Info)
+	}
 	for p, v := range res {
 		if v.FileInfo == nil {
 			info, err := fs.Stat(lfs, p)
 			if err != nil {
 				return nil, err
 			}
-			v.FileInfo = localFileInfo{info}
+			v.FileInfo = localFileInfo{
+				FileInfo:    info,
+				path:        filepath.Join(lfs.root, filepath.FromSlash(p)),
+				noBirthTime: &lfs.noBirthTime,
+			}
 			res[p] = v
 		}
 	}
 	for _, p := range path {
-		absPath := filepath.Join(lfs.basePath, p)
+		absPath := filepath.Join(lfs.root, filepath.FromSlash(p))
 		if fallback, ok := bilibili.PlaceholderMetadata(absPath); ok {
 			if current, exists := res[p]; exists {
 				res[p] = mergeWithFallback(current, *fallback)
@@ -90,7 +110,11 @@ func (lfs *localFS) ReadTags(path ...string) (map[string]metadata.Info, error) {
 			if err != nil {
 				return nil, err
 			}
-			fallback.FileInfo = localFileInfo{info}
+			fallback.FileInfo = localFileInfo{
+				FileInfo:    info,
+				path:        filepath.Join(lfs.root, filepath.FromSlash(p)),
+				noBirthTime: &lfs.noBirthTime,
+			}
 			res[p] = *fallback
 		}
 	}
@@ -122,13 +146,44 @@ func mergeWithFallback(current, fallback metadata.Info) metadata.Info {
 // with metadata.FileInfo
 type localFileInfo struct {
 	fs.FileInfo
+	path        string
+	noBirthTime *sync.Map
 }
 
 func (lfi localFileInfo) BirthTime() time.Time {
 	if ts := times.Get(lfi.FileInfo); ts.HasBirthTime() {
 		return ts.BirthTime()
 	}
+	if bt, ok := lfi.statxBirthTime(); ok {
+		return bt
+	}
 	return time.Now()
+}
+
+// statxBirthTime reads the birth time from the path, which on Linux is the only way to get it.
+// Filesystems that never report one are remembered per device, so a scan asks each only once.
+func (lfi localFileInfo) statxBirthTime() (time.Time, bool) {
+	if lfi.path == "" {
+		return time.Time{}, false
+	}
+	dev, hasDev := deviceID(lfi.FileInfo)
+	memo := lfi.noBirthTime
+	if hasDev && memo != nil {
+		if _, skip := memo.Load(dev); skip {
+			return time.Time{}, false
+		}
+	}
+	ts, err := times.Stat(lfi.path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	if ts.HasBirthTime() {
+		return ts.BirthTime(), true
+	}
+	if hasDev && memo != nil {
+		memo.Store(dev, struct{}{})
+	}
+	return time.Time{}, false
 }
 
 func init() {

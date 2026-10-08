@@ -8,7 +8,7 @@ import (
 
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/conf/configtest"
-	"github.com/navidrome/navidrome/core"
+	"github.com/navidrome/navidrome/core/artwork"
 	"github.com/navidrome/navidrome/core/playlists"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/criteria"
@@ -42,7 +42,7 @@ var _ = Describe("Playlists", func() {
 				"pls-1": {ID: "pls-1", Name: "My Playlist", OwnerID: "user-1"},
 			}
 			mockPlsRepo.TracksRepo = mockTracks
-			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
+			ps = playlists.NewPlaylists(ds, artwork.NewUploader(ds))
 		})
 
 		It("allows owner to delete their playlist", func() {
@@ -73,6 +73,28 @@ var _ = Describe("Playlists", func() {
 		})
 	})
 
+	Describe("Tracks", func() {
+		var mockTracks *tests.MockPlaylistTrackRepo
+
+		BeforeEach(func() {
+			mockTracks = &tests.MockPlaylistTrackRepo{}
+			mockPlsRepo.Data = map[string]*model.Playlist{
+				"pls-1": {ID: "pls-1", Name: "My Playlist", OwnerID: "user-1"},
+			}
+			mockPlsRepo.TracksRepo = mockTracks
+			ps = playlists.NewPlaylists(ds, artwork.NewUploader(ds))
+		})
+
+		It("returns the playlist's track repository", func() {
+			Expect(ps.Tracks(ctx, "pls-1")).To(BeIdenticalTo(mockTracks))
+		})
+
+		It("returns ErrNotFound for an unknown or invisible playlist", func() {
+			_, err := ps.Tracks(ctx, "nonexistent")
+			Expect(err).To(MatchError(model.ErrNotFound))
+		})
+	})
+
 	Describe("Create", func() {
 		BeforeEach(func() {
 			mockPlsRepo.Data = map[string]*model.Playlist{
@@ -80,8 +102,10 @@ var _ = Describe("Playlists", func() {
 				"pls-2": {ID: "pls-2", Name: "Other's", OwnerID: "other-user"},
 				"pls-smart": {ID: "pls-smart", Name: "Smart", OwnerID: "user-1",
 					Rules: &criteria.Criteria{Expression: criteria.Contains{"title": "test"}}},
+				"pls-synced":       {ID: "pls-synced", Name: "Synced", OwnerID: "user-1", Sync: true},
+				"pls-synced-other": {ID: "pls-synced-other", Name: "Other's Synced", OwnerID: "other-user", Sync: true, Public: true},
 			}
-			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
+			ps = playlists.NewPlaylists(ds, artwork.NewUploader(ds))
 		})
 
 		It("creates a new playlist with owner set from context", func() {
@@ -123,6 +147,18 @@ var _ = Describe("Playlists", func() {
 		It("denies replacing tracks on a smart playlist", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
 			_, err := ps.Create(ctx, "pls-smart", "", []string{"song-1"})
+			Expect(err).To(MatchError(model.ErrPlaylistNotEditable))
+		})
+
+		It("denies replacing tracks on a synced playlist", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			_, err := ps.Create(ctx, "pls-synced", "", []string{"song-1"})
+			Expect(err).To(MatchError(model.ErrPlaylistNotEditable))
+		})
+
+		It("denies a non-owner with authorization, not a conflict, on a public synced playlist", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			_, err := ps.Create(ctx, "pls-synced-other", "", []string{"song-1"})
 			Expect(err).To(MatchError(model.ErrNotAuthorized))
 		})
 	})
@@ -137,55 +173,63 @@ var _ = Describe("Playlists", func() {
 				"pls-other": {ID: "pls-other", Name: "Other's", OwnerID: "other-user"},
 				"pls-smart": {ID: "pls-smart", Name: "Smart", OwnerID: "user-1",
 					Rules: &criteria.Criteria{Expression: criteria.Contains{"title": "test"}}},
+				"pls-synced": {ID: "pls-synced", Name: "Synced", OwnerID: "user-1", Sync: true},
 			}
 			mockPlsRepo.TracksRepo = mockTracks
-			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
+			ps = playlists.NewPlaylists(ds, artwork.NewUploader(ds))
 		})
 
 		It("allows owner to update their playlist", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
-			newName := "Updated Name"
-			err := ps.Update(ctx, "pls-1", &newName, nil, nil, nil, nil)
+			err := ps.Update(ctx, "pls-1", new("Updated Name"), nil, nil, nil, nil)
 			Expect(err).ToNot(HaveOccurred())
 		})
 
 		It("allows admin to update any playlist", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "admin-1", IsAdmin: true})
-			newName := "Updated Name"
-			err := ps.Update(ctx, "pls-other", &newName, nil, nil, nil, nil)
+			err := ps.Update(ctx, "pls-other", new("Updated Name"), nil, nil, nil, nil)
 			Expect(err).ToNot(HaveOccurred())
 		})
 
 		It("denies non-owner, non-admin from updating", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "other-user", IsAdmin: false})
-			newName := "Updated Name"
-			err := ps.Update(ctx, "pls-1", &newName, nil, nil, nil, nil)
+			err := ps.Update(ctx, "pls-1", new("Updated Name"), nil, nil, nil, nil)
 			Expect(err).To(MatchError(model.ErrNotAuthorized))
 		})
 
 		It("returns error when playlist not found", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
-			newName := "Updated Name"
-			err := ps.Update(ctx, "nonexistent", &newName, nil, nil, nil, nil)
+			err := ps.Update(ctx, "nonexistent", new("Updated Name"), nil, nil, nil, nil)
 			Expect(err).To(Equal(model.ErrNotFound))
 		})
 
 		It("denies adding tracks to a smart playlist", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
 			err := ps.Update(ctx, "pls-smart", nil, nil, nil, []string{"song-1"}, nil)
-			Expect(err).To(MatchError(model.ErrNotAuthorized))
+			Expect(err).To(MatchError(model.ErrPlaylistNotEditable))
 		})
 
 		It("denies removing tracks from a smart playlist", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
 			err := ps.Update(ctx, "pls-smart", nil, nil, nil, nil, []int{0})
-			Expect(err).To(MatchError(model.ErrNotAuthorized))
+			Expect(err).To(MatchError(model.ErrPlaylistNotEditable))
 		})
 
 		It("allows metadata updates on a smart playlist", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
-			newName := "Updated Smart"
-			err := ps.Update(ctx, "pls-smart", &newName, nil, nil, nil, nil)
+			err := ps.Update(ctx, "pls-smart", new("Updated Smart"), nil, nil, nil, nil)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("denies adding tracks to a synced playlist", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			err := ps.Update(ctx, "pls-synced", nil, nil, nil, []string{"song-1"}, nil)
+			Expect(err).To(MatchError(model.ErrPlaylistNotEditable))
+		})
+
+		It("allows metadata updates on a synced playlist", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			err := ps.Update(ctx, "pls-synced", new("Renamed Synced"), nil, nil, nil, nil)
 			Expect(err).ToNot(HaveOccurred())
 		})
 	})
@@ -199,10 +243,11 @@ var _ = Describe("Playlists", func() {
 				"pls-1": {ID: "pls-1", Name: "My Playlist", OwnerID: "user-1"},
 				"pls-smart": {ID: "pls-smart", Name: "Smart", OwnerID: "user-1",
 					Rules: &criteria.Criteria{Expression: criteria.Contains{"title": "test"}}},
-				"pls-other": {ID: "pls-other", Name: "Other's", OwnerID: "other-user"},
+				"pls-other":  {ID: "pls-other", Name: "Other's", OwnerID: "other-user"},
+				"pls-synced": {ID: "pls-synced", Name: "Synced", OwnerID: "user-1", Sync: true},
 			}
 			mockPlsRepo.TracksRepo = mockTracks
-			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
+			ps = playlists.NewPlaylists(ds, artwork.NewUploader(ds))
 		})
 
 		It("allows owner to add tracks", func() {
@@ -229,7 +274,13 @@ var _ = Describe("Playlists", func() {
 		It("denies editing smart playlists", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
 			_, err := ps.AddTracks(ctx, "pls-smart", []string{"song-1"})
-			Expect(err).To(MatchError(model.ErrNotAuthorized))
+			Expect(err).To(MatchError(model.ErrPlaylistNotEditable))
+		})
+
+		It("denies editing synced playlists", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			_, err := ps.AddTracks(ctx, "pls-synced", []string{"song-1"})
+			Expect(err).To(MatchError(model.ErrPlaylistNotEditable))
 		})
 
 		It("returns error when playlist not found", func() {
@@ -250,7 +301,7 @@ var _ = Describe("Playlists", func() {
 					Rules: &criteria.Criteria{Expression: criteria.Contains{"title": "test"}}},
 			}
 			mockPlsRepo.TracksRepo = mockTracks
-			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
+			ps = playlists.NewPlaylists(ds, artwork.NewUploader(ds))
 		})
 
 		It("allows owner to remove tracks", func() {
@@ -263,13 +314,50 @@ var _ = Describe("Playlists", func() {
 		It("denies on smart playlist", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
 			err := ps.RemoveTracks(ctx, "pls-smart", []string{"track-1"})
-			Expect(err).To(MatchError(model.ErrNotAuthorized))
+			Expect(err).To(MatchError(model.ErrPlaylistNotEditable))
 		})
 
 		It("denies non-owner", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "other-user", IsAdmin: false})
 			err := ps.RemoveTracks(ctx, "pls-1", []string{"track-1"})
 			Expect(err).To(MatchError(model.ErrNotAuthorized))
+		})
+	})
+
+	Describe("InsertTracks", func() {
+		var mockTracks *tests.MockPlaylistTrackRepo
+
+		BeforeEach(func() {
+			mockTracks = &tests.MockPlaylistTrackRepo{AddCount: 2}
+			mockPlsRepo.Data = map[string]*model.Playlist{
+				"pls-1": {ID: "pls-1", Name: "My Playlist", OwnerID: "user-1"},
+				"pls-smart": {ID: "pls-smart", Name: "Smart", OwnerID: "user-1",
+					Rules: &criteria.Criteria{Expression: criteria.Contains{"title": "test"}}},
+			}
+			mockPlsRepo.TracksRepo = mockTracks
+			ps = playlists.NewPlaylists(ds, artwork.NewUploader(ds))
+		})
+
+		It("inserts the tracks at the given position for the owner", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			count, err := ps.InsertTracks(ctx, "pls-1", []string{"song-1", "song-2"}, 3)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(count).To(Equal(2))
+			Expect(mockTracks.AddedIds).To(Equal([]string{"song-1", "song-2"}))
+			Expect(mockTracks.InsertPos).To(Equal(3))
+		})
+
+		It("denies non-owner, non-admin", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "other-user", IsAdmin: false})
+			_, err := ps.InsertTracks(ctx, "pls-1", []string{"song-1"}, 1)
+			Expect(err).To(MatchError(model.ErrNotAuthorized))
+			Expect(mockTracks.AddedIds).To(BeEmpty())
+		})
+
+		It("denies editing smart playlists", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			_, err := ps.InsertTracks(ctx, "pls-smart", []string{"song-1"}, 1)
+			Expect(err).To(MatchError(model.ErrPlaylistNotEditable))
 		})
 	})
 
@@ -284,7 +372,7 @@ var _ = Describe("Playlists", func() {
 					Rules: &criteria.Criteria{Expression: criteria.Contains{"title": "test"}}},
 			}
 			mockPlsRepo.TracksRepo = mockTracks
-			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
+			ps = playlists.NewPlaylists(ds, artwork.NewUploader(ds))
 		})
 
 		It("allows owner to reorder", func() {
@@ -297,7 +385,7 @@ var _ = Describe("Playlists", func() {
 		It("denies on smart playlist", func() {
 			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
 			err := ps.ReorderTrack(ctx, "pls-smart", 1, 3)
-			Expect(err).To(MatchError(model.ErrNotAuthorized))
+			Expect(err).To(MatchError(model.ErrPlaylistNotEditable))
 		})
 	})
 
@@ -313,7 +401,7 @@ var _ = Describe("Playlists", func() {
 				"pls-1":     {ID: "pls-1", Name: "My Playlist", OwnerID: "user-1"},
 				"pls-other": {ID: "pls-other", Name: "Other's", OwnerID: "other-user"},
 			}
-			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
+			ps = playlists.NewPlaylists(ds, artwork.NewUploader(ds))
 		})
 
 		It("saves image file and updates UploadedImage", func() {
@@ -383,7 +471,7 @@ var _ = Describe("Playlists", func() {
 				"pls-empty": {ID: "pls-empty", Name: "No Cover", OwnerID: "user-1"},
 				"pls-other": {ID: "pls-other", Name: "Other's", OwnerID: "other-user"},
 			}
-			ps = playlists.NewPlaylists(ds, core.NewImageUploadService())
+			ps = playlists.NewPlaylists(ds, artwork.NewUploader(ds))
 		})
 
 		It("removes file and clears UploadedImage", func() {
@@ -401,6 +489,24 @@ var _ = Describe("Playlists", func() {
 			err := ps.RemoveImage(ctx, "pls-empty")
 			Expect(err).ToNot(HaveOccurred())
 			Expect(mockPlsRepo.Last.UploadedImage).To(BeEmpty())
+		})
+
+		It("clears the resolved artwork state and re-queues after removing an upload", func() {
+			ctx = request.WithUser(ctx, model.User{ID: "user-1", IsAdmin: false})
+			Expect(ds.Artwork().PutItemArtwork(ctx, &model.ItemArtwork{
+				ItemKind: "pl", ItemID: "pls-1", Hash: "oldhash", Source: "upload",
+			})).To(Succeed())
+
+			Expect(ps.RemoveImage(ctx, "pls-1")).To(Succeed())
+
+			_, err := ds.Artwork().GetItemArtwork(ctx, model.KindPlaylistArtwork, "pls-1", model.ImageTypePrimary)
+			Expect(err).To(MatchError(model.ErrNotFound))
+			queued, _ := ds.ArtworkQueue().DequeueBatch(ctx, 100)
+			Expect(queued).To(ContainElement(SatisfyAll(
+				HaveField("ItemKind", "pl"),
+				HaveField("ItemID", "pls-1"),
+				HaveField("Priority", model.ArtworkPriorityBump),
+			)))
 		})
 
 		It("denies non-owner", func() {

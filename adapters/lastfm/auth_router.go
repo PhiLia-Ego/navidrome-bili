@@ -18,6 +18,7 @@ import (
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 	"github.com/navidrome/navidrome/server"
+	"github.com/navidrome/navidrome/utils/httpclient"
 	"github.com/navidrome/navidrome/utils/req"
 )
 
@@ -41,9 +42,7 @@ func NewRouter(ds model.DataStore) *Router {
 		sessionKeys: &agents.SessionKeys{DataStore: ds, KeyName: sessionKeyProperty},
 	}
 	r.Handler = r.routes()
-	hc := &http.Client{
-		Timeout: consts.DefaultHttpClientTimeOut,
-	}
+	hc := httpclient.New(consts.DefaultHttpClientTimeOut)
 	r.client = newClient(r.apiKey, r.secret, hc)
 	return r
 }
@@ -77,6 +76,13 @@ func (s *Router) getLinkStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp["status"] = key != ""
+	linkToken, err := createLinkToken(u.ID)
+	if err != nil {
+		log.Error(r.Context(), "Could not create LastFM link token", "userId", u.ID, err)
+		_ = rest.RespondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	resp["linkToken"] = linkToken
 	_ = rest.RespondWithJSON(w, http.StatusOK, resp)
 }
 
@@ -97,9 +103,15 @@ func (s *Router) callback(w http.ResponseWriter, r *http.Request) {
 		_ = rest.RespondWithError(w, http.StatusBadRequest, "token not received")
 		return
 	}
-	uid, err := p.String("uid")
+	linkToken, err := p.String("uid")
 	if err != nil {
 		_ = rest.RespondWithError(w, http.StatusBadRequest, "uid not received")
+		return
+	}
+	uid, err := verifyLinkToken(linkToken)
+	if err != nil {
+		log.Warn(r.Context(), "Rejected LastFM callback with invalid link token", "requestId", middleware.GetReqID(r.Context()), err)
+		_ = rest.RespondWithError(w, http.StatusBadRequest, "invalid link token")
 		return
 	}
 
@@ -120,7 +132,7 @@ func (s *Router) callback(w http.ResponseWriter, r *http.Request) {
 func (s *Router) fetchSessionKey(ctx context.Context, uid, token string) error {
 	sessionKey, err := s.client.getSession(ctx, token)
 	if err != nil {
-		log.Error(ctx, "Could not fetch LastFM session key", "userId", uid, "token", token,
+		log.Error(ctx, "Could not fetch LastFM session key", "userId", uid,
 			"requestId", middleware.GetReqID(ctx), err)
 		return err
 	}

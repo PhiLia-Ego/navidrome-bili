@@ -77,7 +77,7 @@ var _ = Describe("MediaAnnotationController", func() {
 		Context("submission=false", func() {
 			var req *http.Request
 			BeforeEach(func() {
-				_ = ds.MediaFile(ctx).Put(&model.MediaFile{ID: "12"})
+				_ = ds.MediaFile().Put(ctx, &model.MediaFile{ID: "12"})
 				ctx = request.WithPlayer(ctx, model.Player{ID: "player-1"})
 				req = newGetRequest("id=12", "submission=false")
 				req = req.WithContext(ctx)
@@ -183,6 +183,64 @@ var _ = Describe("MediaAnnotationController", func() {
 			Expect(playTracker.ReportedPlayback[0].IgnoreScrobble).To(BeFalse())
 			Expect(playTracker.ReportedPlayback[0].ClientId).To(Equal("p1"))
 			Expect(playTracker.ReportedPlayback[0].ClientName).To(BeEmpty())
+		})
+	})
+
+	Describe("Star/Unstar playlists", func() {
+		var plRepo *tests.MockPlaylistRepo
+
+		BeforeEach(func() {
+			plRepo = tests.CreateMockPlaylistRepo()
+			plRepo.SetData(model.Playlists{{ID: "pl-1", Name: "My Playlist", OwnerID: "u1"}})
+			ds.(*tests.MockDataStore).MockedPlaylist = plRepo
+		})
+
+		It("stars a playlist by dispatching to the Playlist repo", func() {
+			r := newGetRequest("id=pl-1")
+
+			_, err := router.Star(r)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(plRepo.Starred).To(HaveKeyWithValue("pl-1", true))
+		})
+
+		It("unstars a playlist by dispatching to the Playlist repo", func() {
+			r := newGetRequest("id=pl-1")
+
+			_, err := router.Unstar(r)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(plRepo.Starred).To(HaveKeyWithValue("pl-1", false))
+		})
+	})
+
+	Describe("SetRating playlists", func() {
+		var plRepo *tests.MockPlaylistRepo
+
+		BeforeEach(func() {
+			plRepo = tests.CreateMockPlaylistRepo()
+			plRepo.SetData(model.Playlists{{ID: "pl-1", Name: "My Playlist", OwnerID: "u1"}})
+			ds.(*tests.MockDataStore).MockedPlaylist = plRepo
+		})
+
+		It("rates a playlist by dispatching to the Playlist repo", func() {
+			r := newGetRequest("id=pl-1", "rating=4")
+
+			_, err := router.SetRating(r)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(plRepo.Ratings).To(HaveKeyWithValue("pl-1", 4))
+		})
+	})
+
+	Describe("Star with an unresolvable id", func() {
+		It("skips the id without broadcasting an empty (wildcard) refresh", func() {
+			r := newGetRequest("id=does-not-exist")
+
+			_, err := router.Star(r)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eventBroker.Events).To(BeEmpty())
 		})
 	})
 })
