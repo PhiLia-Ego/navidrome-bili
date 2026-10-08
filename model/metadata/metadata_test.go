@@ -4,11 +4,11 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/metadata"
 	"github.com/navidrome/navidrome/utils"
-	"github.com/navidrome/navidrome/utils/gg"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -106,7 +106,7 @@ var _ = Describe("Metadata", func() {
 				props.Tags = model.RawTags{
 					"Title":      {strings.Repeat("a", 2048)},
 					"Comment":    {strings.Repeat("a", 8192)},
-					"lyrics:xxx": {strings.Repeat("a", 60000)},
+					"lyrics:xxx": {strings.Repeat("a", 2_000_000)},
 				}
 				md = metadata.New(filePath, props)
 
@@ -117,10 +117,48 @@ var _ = Describe("Metadata", func() {
 				Expect(pair).To(HaveLen(1))
 				Expect(pair[0].Key()).To(Equal("xxx"))
 
+				// Lyrics keep a much larger cap so word-timed karaoke survives.
 				// Note: a total of 6 characters are lost from maxLength from
-				// the key portion and separator
-				Expect(pair[0].Value()).To(HaveLen(32762))
+				// the key portion and separator.
+				Expect(pair[0].Value()).To(HaveLen(1048570))
 			})
+
+			It("should not split a multi-byte character when truncating", func() {
+				// 1024 is not a multiple of 3, so a byte-wise cut lands mid-rune.
+				props.Tags = model.RawTags{
+					"Title": {strings.Repeat("日", 2048)},
+				}
+				md = metadata.New(filePath, props)
+
+				title := md.String(model.TagTitle)
+				Expect(utf8.ValidString(title)).To(BeTrue(), "truncation produced invalid UTF-8")
+				Expect(len(title)).To(BeNumerically("<=", 1024))
+			})
+
+			It("should keep invalid bytes that are not at the truncation point", func() {
+				props.Tags = model.RawTags{
+					"Title": {"a\xffb" + strings.Repeat("c", 2048)},
+				}
+				md = metadata.New(filePath, props)
+
+				Expect(md.String(model.TagTitle)).To(HaveLen(1024))
+			})
+
+			DescribeTable("should normalize UUID tags to their canonical form",
+				func(raw, expected string) {
+					props.Tags = model.RawTags{"musicbrainz_artistid": {raw}}
+					md = metadata.New(filePath, props)
+
+					Expect(md.String(model.TagMusicBrainzArtistID)).To(Equal(expected))
+				},
+				Entry("canonical", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+				Entry("uppercase", "F81D4FAE-7DEC-11D0-A765-00A0C91E6BF6", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+				Entry("braced", "{f81d4fae-7dec-11d0-a765-00a0c91e6bf6}", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+				Entry("urn prefix", "urn:uuid:f81d4fae-7dec-11d0-a765-00a0c91e6bf6", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+				Entry("quoted", `"f81d4fae-7dec-11d0-a765-00a0c91e6bf6"`, "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+				Entry("no dashes", "f81d4fae7dec11d0a76500a0c91e6bf6", "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+				Entry("not a uuid", "the beatles", ""),
+			)
 
 			It("should split multiple values", func() {
 				props.Tags = model.RawTags{
@@ -129,6 +167,21 @@ var _ = Describe("Metadata", func() {
 				md = metadata.New(filePath, props)
 
 				Expect(md.Strings(model.TagGenre)).To(Equal([]string{"Rock", "Pop", "Punk"}))
+			})
+
+			// Regression test for https://github.com/navidrome/navidrome/issues/5065
+			//
+			// MP3s with both an ID3v2 TMOO frame and a TXXX:MOOD frame are surfaced by
+			// TagLib's PropertyMap as a single "mood" key with multiple values. The split
+			// configuration must still apply to each value individually.
+			It("should split values from multiple frames mapping to the same tag", func() {
+				props.Tags = model.RawTags{
+					// Same shape as the bug report: two frames, comma-separated content.
+					"mood": {"Love, Emotional, Ballad", "Love; Emotional; Ballad"},
+				}
+				md = metadata.New(filePath, props)
+
+				Expect(md.Strings(model.TagMood)).To(ConsistOf("Love", "Emotional", "Ballad"))
 			})
 		})
 
@@ -173,6 +226,10 @@ var _ = Describe("Metadata", func() {
 			Entry(nil, "2/10", "", 2, 10),
 			Entry(nil, "", "", 0, 0),
 			Entry(nil, "A", "", 0, 0),
+			Entry("ignores values that do not fit in 32 bits", "4294967295", "4294967296", 0, 0),
+			Entry("ignores a total that does not fit in 32 bits", "2/4294967295", "", 2, 0),
+			Entry("keeps the largest 32-bit value", "2147483647", "", 2147483647, 0),
+			Entry("ignores negative values", "-1", "-2", 0, 0),
 		)
 
 		Describe("Performers", func() {
@@ -266,7 +323,7 @@ var _ = Describe("Metadata", func() {
 					tag: {tagValue},
 				}
 				md = metadata.New(filePath, props)
-				return md.ToMediaFile(0, "0")
+				return md.ToMediaFile(model.Library{}, "0")
 			}
 
 			DescribeTable("Gain",
@@ -274,8 +331,8 @@ var _ = Describe("Metadata", func() {
 					mf := createMF("replaygain_track_gain", tagValue)
 					Expect(mf.RGTrackGain).To(Equal(expected))
 				},
-				Entry("0", "0", gg.P(0.0)),
-				Entry("1.2dB", "1.2dB", gg.P(1.2)),
+				Entry("0", "0", new(0.0)),
+				Entry("1.2dB", "1.2dB", new(1.2)),
 				Entry("Infinity", "Infinity", nil),
 				Entry("Invalid value", "INVALID VALUE", nil),
 				Entry("NaN", "NaN", nil),
@@ -285,9 +342,9 @@ var _ = Describe("Metadata", func() {
 					mf := createMF("replaygain_track_peak", tagValue)
 					Expect(mf.RGTrackPeak).To(Equal(expected))
 				},
-				Entry("0", "0", gg.P(0.0)),
-				Entry("1.0", "1.0", gg.P(1.0)),
-				Entry("0.5", "0.5", gg.P(0.5)),
+				Entry("0", "0", new(0.0)),
+				Entry("1.0", "1.0", new(1.0)),
+				Entry("0.5", "0.5", new(0.5)),
 				Entry("Invalid dB suffix", "0.7dB", nil),
 				Entry("Infinity", "Infinity", nil),
 				Entry("Invalid value", "INVALID VALUE", nil),
@@ -299,8 +356,8 @@ var _ = Describe("Metadata", func() {
 					Expect(mf.RGTrackGain).To(Equal(expected))
 
 				},
-				Entry("0", "0", gg.P(5.0)),
-				Entry("-3776", "-3776", gg.P(-9.75)),
+				Entry("0", "0", new(5.0)),
+				Entry("-3776", "-3776", new(-9.75)),
 				Entry("Infinity", "Infinity", nil),
 				Entry("Invalid value", "INVALID VALUE", nil),
 			)

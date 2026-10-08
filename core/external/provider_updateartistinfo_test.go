@@ -13,7 +13,6 @@ import (
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/tests"
-	"github.com/navidrome/navidrome/utils/gg"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
@@ -38,8 +37,8 @@ var _ = Describe("Provider - UpdateArtistInfo", func() {
 		ctx = GinkgoT().Context()
 		ds = new(tests.MockDataStore)
 		ag = new(mockAgents)
-		p = external.NewProvider(ds, ag, matcher.New(ds))
-		mockArtistRepo = ds.Artist(ctx).(*tests.MockArtistRepo)
+		p = external.NewProvider(ds, ag, matcher.New(ds), &fakeBroker{})
+		mockArtistRepo = ds.Artist().(*tests.MockArtistRepo)
 	})
 
 	It("returns error when artist is not found", func() {
@@ -105,6 +104,25 @@ var _ = Describe("Provider - UpdateArtistInfo", func() {
 		ag.AssertExpectations(GinkgoT())
 	})
 
+	// Stamping a throttled round would cache the empty result for the whole TTL.
+	It("does not stamp ExternalInfoUpdatedAt when the agents are throttled", func() {
+		originalArtist := &model.Artist{ID: "ar-throttled", Name: "Throttled Artist"}
+		mockArtistRepo.SetData(model.Artists{*originalArtist})
+
+		ag.On("GetArtistMBID", ctx, "ar-throttled", "Throttled Artist").Return("", agents.ErrRetryLater).Once()
+		ag.On("GetArtistImages", ctx, "ar-throttled", "Throttled Artist", "").Return(nil, agents.ErrRetryLater).Once()
+		ag.On("GetArtistBiography", ctx, "ar-throttled", "Throttled Artist", "").Return("", agents.ErrRetryLater).Once()
+		ag.On("GetArtistURL", ctx, "ar-throttled", "Throttled Artist", "").Return("", agents.ErrRetryLater).Once()
+		ag.On("GetSimilarArtists", ctx, "ar-throttled", "Throttled Artist", "", 100).Return(nil, agents.ErrRetryLater).Once()
+
+		updatedArtist, err := p.UpdateArtistInfo(ctx, "ar-throttled", 10, false)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(updatedArtist).NotTo(BeNil())
+		Expect(updatedArtist.ExternalInfoUpdatedAt).To(BeNil())
+		ag.AssertExpectations(GinkgoT())
+	})
+
 	It("preserves decoded plain text in biography storage", func() {
 		originalArtist := &model.Artist{
 			ID:   "ar-encoded-bio",
@@ -137,7 +155,7 @@ var _ = Describe("Provider - UpdateArtistInfo", func() {
 			ExternalUrl:           "http://cached.url",
 			Biography:             "Cached Bio",
 			LargeImageUrl:         "http://cached_large.jpg",
-			ExternalInfoUpdatedAt: gg.P(now.Add(-conf.Server.DevArtistInfoTimeToLive / 2)),
+			ExternalInfoUpdatedAt: new(now.Add(-conf.Server.DevArtistInfoTimeToLive / 2)),
 			SimilarArtists: model.Artists{
 				{ID: "ar-similar-present", Name: "Similar Present"},
 				{ID: "ar-similar-absent", Name: "Similar Absent"},
@@ -174,7 +192,7 @@ var _ = Describe("Provider - UpdateArtistInfo", func() {
 		originalArtist := &model.Artist{
 			ID:                    "ar-expired",
 			Name:                  "Expired Artist",
-			ExternalInfoUpdatedAt: gg.P(expiredTime),
+			ExternalInfoUpdatedAt: new(expiredTime),
 			SimilarArtists: model.Artists{
 				{ID: "ar-exp-similar", Name: "Expired Similar"},
 			},
@@ -205,7 +223,7 @@ var _ = Describe("Provider - UpdateArtistInfo", func() {
 		originalArtist := &model.Artist{
 			ID:                    "ar-similar-test",
 			Name:                  "Similar Test Artist",
-			ExternalInfoUpdatedAt: gg.P(now.Add(-conf.Server.DevArtistInfoTimeToLive / 2)),
+			ExternalInfoUpdatedAt: new(now.Add(-conf.Server.DevArtistInfoTimeToLive / 2)),
 			SimilarArtists: model.Artists{
 				{ID: "ar-sim-present", Name: "Similar Present"},
 				{ID: "", Name: "Similar Absent Raw"},

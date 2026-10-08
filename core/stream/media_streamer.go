@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -29,13 +30,19 @@ type MediaStreamer interface {
 type TranscodingCache cache.FileCache
 
 func NewMediaStreamer(ds model.DataStore, t ffmpeg.FFmpeg, cache TranscodingCache) MediaStreamer {
-	return &mediaStreamer{ds: ds, transcoder: t, cache: cache}
+	return &mediaStreamer{
+		ds:         ds,
+		transcoder: t,
+		cache:      cache,
+		limiter:    NewTranscodeLimiter(conf.Server.Transcoding.MaxConcurrent, conf.Server.Transcoding.MaxConcurrentPerUser),
+	}
 }
 
 type mediaStreamer struct {
 	ds         model.DataStore
 	transcoder ffmpeg.FFmpeg
 	cache      cache.FileCache
+	limiter    TranscodeLimiter
 }
 
 type streamJob struct {
@@ -108,7 +115,12 @@ func (ms *mediaStreamer) NewStream(ctx context.Context, mf *model.MediaFile, req
 	}
 	r, err := ms.cache.Get(ctx, job)
 	if err != nil {
-		log.Error(ctx, "Error accessing transcoding cache", "id", mf.ID, err)
+		// Rate-limit rejections are already logged at warn level by the
+		// producer; treating them as cache failures here would both
+		// double-log and mask actual cache problems.
+		if !errors.Is(err, ErrTooManyTranscodes) {
+			log.Error(ctx, "Error accessing transcoding cache", "id", mf.ID, err)
+		}
 		return nil, err
 	}
 	cached = r.Cached
@@ -125,7 +137,7 @@ func (ms *mediaStreamer) NewStream(ctx context.Context, mf *model.MediaFile, req
 }
 
 type Stream struct {
-	ctx     context.Context
+	ctx     context.Context //nolint:containedctx // stream outlives the call that built it; Read has no ctx
 	mf      *model.MediaFile
 	bitRate int
 	format  string
@@ -144,8 +156,9 @@ func (s *Stream) EstimatedContentLength() int {
 
 // Serve writes the stream to the HTTP response. For seekable streams it uses http.ServeContent
 // (supporting range requests). For non-seekable streams it writes directly and logs any errors.
-// Returns the number of bytes written and an error only when io.Copy fails with 0 bytes written
+// Returns the number of bytes written and an error only when it fails with 0 bytes written
 // (meaning the HTTP 200 status has not been flushed yet and the caller can still send an error response).
+// Once bytes are on the wire it panics with http.ErrAbortHandler instead, aborting the response.
 // Empty output (0 bytes, no error) is logged but not treated as an error.
 func (s *Stream) Serve(ctx context.Context, w http.ResponseWriter, r *http.Request) (int64, error) {
 	if s.Seekable() {
@@ -175,7 +188,8 @@ func (s *Stream) Serve(ctx context.Context, w http.ResponseWriter, r *http.Reque
 			w.Header().Del("Content-Length")
 			return 0, fmt.Errorf("sending transcoded file: %w", err)
 		}
-		return c, nil
+		// The 200 is already sent, so dropping the connection is the only way to say "truncated".
+		panic(http.ErrAbortHandler)
 	}
 	if c == 0 {
 		log.Error(ctx, "Transcoding returned empty output, ffmpeg may have failed. "+
@@ -221,15 +235,31 @@ func NewTranscodingCache() TranscodingCache {
 				return nil, os.ErrInvalid
 			}
 
-			// Choose the appropriate context based on EnableTranscodingCancellation configuration.
-			// This is where we decide whether transcoding processes should be cancellable or not.
+			release, err := job.ms.limiter.Acquire(ctx, limiterKey(ctx))
+			if err != nil {
+				log.Warn(ctx, "Refusing transcode: concurrent transcode limit reached",
+					"id", job.mf.ID, "user", userName(ctx),
+					"maxConcurrent", conf.Server.Transcoding.MaxConcurrent,
+					"maxPerUser", conf.Server.Transcoding.MaxConcurrentPerUser)
+				return nil, err
+			}
+
+			// Choose the context that drives the ffmpeg process.
+			//
+			// When the limiter is enabled, force the request context so a
+			// client disconnect cancels ffmpeg and frees the slot promptly.
+			// Otherwise a client could open many transcodes, disconnect
+			// immediately, and still leave the configured cap's worth of
+			// ffmpeg processes draining in the background — which is exactly
+			// the DoS the limiter is meant to prevent.
+			//
+			// When the limiter is disabled, preserve the legacy behavior
+			// governed by Transcoding.EnableCancellation so unchanged configs
+			// keep their previous observable behavior.
 			var transcodingCtx context.Context
-			if conf.Server.EnableTranscodingCancellation {
-				// Use the request context directly, allowing cancellation when client disconnects
+			if job.ms.limiter.Enabled() || conf.Server.Transcoding.EnableCancellation {
 				transcodingCtx = ctx
 			} else {
-				// Use background context with request values preserved.
-				// This prevents cancellation but maintains request metadata (user, client, etc.)
 				transcodingCtx = request.AddValues(context.Background(), ctx)
 			}
 
@@ -242,12 +272,17 @@ func NewTranscodingCache() TranscodingCache {
 				BitDepth:   job.bitDepth,
 				Channels:   job.channels,
 				Offset:     job.offset,
+				Duration:   job.mf.Duration,
 			})
 			if err != nil {
+				release()
 				log.Error(ctx, "Error starting transcoder", "id", job.mf.ID, err)
 				return nil, os.ErrInvalid
 			}
-			return out, nil
+			// Tie the slot to the ffmpeg process: copyAndClose calls Close
+			// on this reader after io.Copy returns, which is exactly when
+			// ffmpeg has exited (either EOF or context cancellation).
+			return &releasingReadCloser{ReadCloser: out, release: release}, nil
 		})
 }
 
@@ -258,4 +293,17 @@ func userName(ctx context.Context) string {
 	} else {
 		return user.UserName
 	}
+}
+
+// limiterKey returns the per-user bucket key used by the transcode limiter.
+// For anonymous requests (e.g. public shares) it returns the empty string,
+// which signals the limiter to skip the per-user cap entirely — otherwise
+// every anonymous viewer of a public share would collide on the same key
+// and starve each other within MaxConcurrentPerUser slots. The global cap
+// still applies and remains the protection against runaway anonymous load.
+func limiterKey(ctx context.Context) string {
+	if user, ok := request.UserFrom(ctx); ok {
+		return user.UserName
+	}
+	return ""
 }

@@ -2,20 +2,20 @@ package metadata
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"maps"
 	"math"
 	"strconv"
 
-	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/utils/str"
 )
 
-func (md Metadata) ToMediaFile(libID int, folderID string) model.MediaFile {
+func (md Metadata) ToMediaFile(lib model.Library, folderID string) model.MediaFile {
 	mf := model.MediaFile{
-		LibraryID: libID,
+		LibraryID: lib.ID,
 		FolderID:  folderID,
 		Tags:      maps.Clone(md.tags),
 	}
@@ -35,7 +35,11 @@ func (md Metadata) ToMediaFile(libID int, folderID string) model.MediaFile {
 	mf.DiscSubtitle = md.String(model.TagDiscSubtitle)
 	mf.CatalogNum = md.String(model.TagCatalogNumber)
 	mf.Comment = md.String(model.TagComment)
-	mf.BPM = int(math.Round(md.Float(model.TagBPM)))
+	if f := md.NullableFloat(model.TagBPM); f != nil {
+		if r := math.Round(*f); r > 0 && r <= math.MaxInt32 {
+			mf.BPM = new(int(r))
+		}
+	}
 	mf.Lyrics = md.mapLyrics()
 	mf.ExplicitStatus = md.mapExplicitStatusTag()
 
@@ -63,7 +67,9 @@ func (md Metadata) ToMediaFile(libID int, folderID string) model.MediaFile {
 	mf.Duration = md.Length()
 	mf.BitRate = md.AudioProperties().BitRate
 	mf.SampleRate = md.AudioProperties().SampleRate
-	mf.BitDepth = md.AudioProperties().BitDepth
+	if bd := md.AudioProperties().BitDepth; bd > 0 {
+		mf.BitDepth = new(bd)
+	}
 	mf.Channels = md.AudioProperties().Channels
 	mf.Codec = md.AudioProperties().Codec
 	mf.Path = md.FilePath()
@@ -77,8 +83,9 @@ func (md Metadata) ToMediaFile(libID int, folderID string) model.MediaFile {
 	mf.AlbumArtist = md.mapDisplayAlbumArtist(mf)
 
 	// Persistent IDs
-	mf.PID = md.trackPID(mf)
-	mf.AlbumID = md.albumID(mf, conf.Server.PID.Album)
+	pid := lib.EffectivePID()
+	mf.PID = md.trackPID(mf, pid)
+	mf.AlbumID = md.albumID(mf, pid.Album)
 
 	// BFR These IDs will go away once the UI handle multiple participants.
 	// BFR For Legacy Subsonic compatibility, we will set them in the API handlers
@@ -133,17 +140,20 @@ func (md Metadata) mapLyrics() string {
 
 	lyricList := make(model.LyricList, 0, len(rawLyrics))
 
+	ctx := log.NewContext(context.Background(), "file", md.filePath)
 	for _, raw := range rawLyrics {
 		lang := raw.Key()
 		text := raw.Value()
 
-		lyrics, err := model.ToLyrics(lang, text)
+		lyrics, err := model.ParseLyrics(ctx, "", lang, []byte(text))
 		if err != nil {
-			log.Warn("Unexpected failure occurred when parsing lyrics", "file", md.filePath, err)
+			log.Warn(ctx, "Unexpected failure occurred when parsing lyrics", err)
 			continue
 		}
-		if !lyrics.IsEmpty() {
-			lyricList = append(lyricList, *lyrics)
+		for _, lyric := range lyrics {
+			if !lyric.IsEmpty() {
+				lyricList = append(lyricList, lyric)
+			}
 		}
 	}
 
